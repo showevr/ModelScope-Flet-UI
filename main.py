@@ -9,6 +9,8 @@ import hashlib
 import struct
 import zlib
 import io
+import shutil   # 【新增】用于复制文件
+import tempfile # 【新增】获取临时目录
 
 # ==========================================
 #      【安全导入层】防止手机端崩溃
@@ -236,31 +238,33 @@ async def main(page: ft.Page):
 
     # ================= 3. 定义文件保存器 (修复版：解决0KB问题) =================
     
-    # 【新增】用于临时存储待下载的二进制数据，不绑定在控件上
-    pending_save_bytes = None
+    # 【修改】用于临时存储文件路径，而非二进制数据
+    temp_img_path = None
 
     def on_save_file_result(e: ft.FilePickerResultEvent):
-        nonlocal pending_save_bytes
-        if e.path:
+        nonlocal temp_img_path
+        if e.path and temp_img_path and os.path.exists(temp_img_path):
             try:
-                # 【修改】从闭包变量读取数据
-                if pending_save_bytes:
-                    with open(e.path, "wb") as f:
-                        f.write(pending_save_bytes)
-                    
-                    page.snack_bar = ft.SnackBar(ft.Text(f"✅ 图片已保存"), open=True)
-                    # 保存后清空内存
-                    pending_save_bytes = None
-                else:
-                     page.snack_bar = ft.SnackBar(ft.Text(f"❌ 保存失败：数据丢失"), open=True, bgcolor="red")
+                # 【修改】使用 shutil.copy 直接从临时文件复制，解决内存回收导致的 0KB 问题
+                shutil.copy(temp_img_path, e.path)
+                
+                page.snack_bar = ft.SnackBar(ft.Text(f"✅ 图片已保存"), open=True)
+                
+                # 保存后清理临时文件
+                try: os.remove(temp_img_path)
+                except: pass
+                temp_img_path = None
                 
                 page.update()
             except Exception as ex:
                 page.snack_bar = ft.SnackBar(ft.Text(f"保存文件失败: {ex}"), open=True, bgcolor="red")
                 page.update()
         else:
-            # 取消保存也清空
-            pending_save_bytes = None
+            # 取消保存不操作，但如果临时文件存在建议清理
+            # if temp_img_path and os.path.exists(temp_img_path):
+            #     try: os.remove(temp_img_path)
+            #     except: pass
+            temp_img_path = None
             pass
 
     save_file_picker = ft.FilePicker(on_result=on_save_file_result)
@@ -342,7 +346,7 @@ async def main(page: ft.Page):
 
     # --- 下载图片逻辑 (全平台通用稳健版) ---
     async def download_image(url, metadata=None):
-        nonlocal pending_save_bytes
+        nonlocal temp_img_path
         if not url: return False
         try:
             # 1. 下载图片数据
@@ -353,11 +357,16 @@ async def main(page: ft.Page):
                 if metadata:
                     image_bytes = add_metadata_to_png(image_bytes, metadata)
                 
-                # 2. 【修改】将数据存入外部变量，不挂载到控件上
-                pending_save_bytes = image_bytes
+                # 2. 【修改】将数据写入临时文件，防止 Activity 切换时内存数据丢失
+                tmp_dir = tempfile.gettempdir()
+                timestamp = int(time.time())
+                temp_filename = f"temp_zsy_{timestamp}.png"
+                temp_img_path = os.path.join(tmp_dir, temp_filename)
+                
+                with open(temp_img_path, "wb") as f:
+                    f.write(image_bytes)
                 
                 # 3. 触发保存流程
-                timestamp = int(time.time())
                 filename = f"img_{timestamp}_{random.randint(100,999)}.png"
                 
                 save_file_picker.save_file(dialog_title="保存图片", file_name=filename, allowed_extensions=["png"])
@@ -1315,7 +1324,8 @@ async def main(page: ft.Page):
             is_selected = (hex_c == current_primary_color)
             return ft.Container(
                 width=45, height=45, bgcolor=hex_c, border_radius=22,
-                on_click=lambda e, n=name: update_theme(color_name=n),
+                # 【修改点 1：必须 wrap 异步任务】
+                on_click=lambda e, n=name: asyncio.create_task(update_theme(color_name=n)),
                 border=ft.border.all(3, current_primary_color) if is_selected else None,
                 scale=MyScale(1.1 if is_selected else 1.0) if MyScale else None,
                 animate_scale=MyAnimation(200, "easeOut") if MyAnimation else None
@@ -1328,7 +1338,8 @@ async def main(page: ft.Page):
                 border=ft.border.all(1.5, current_primary_color if is_active else "grey"),
                 border_radius=20,
                 bgcolor=get_opacity_color(0.1, current_primary_color) if is_active else None,
-                on_click=lambda e, m=mode_val: update_theme(mode=m)
+                # 【修改点 2：必须 wrap 异步任务】
+                on_click=lambda e, m=mode_val: asyncio.create_task(update_theme(mode=m))
             )
         return ft.Column([
             ft.Text("莫兰迪色系", size=13, color="grey"),
