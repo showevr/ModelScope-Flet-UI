@@ -47,17 +47,12 @@ jobs:
           pip install -r requirements.txt
           flet --version
 
-      # 【关键修复】Build APK
-      # 1. 将 --permissions 改为 --android-permissions
-      # 2. 权限列表直接用空格分隔跟在参数后面
+      # 【修正】Build APK
+      # 删除了 --android-permissions 参数，避免验证报错
+      # Flet 会自动处理必要的网络和文件选择权限
       - name: Build APK
         run: |
-          flet build apk . \
-            --org "com.zhaishengyuan" \
-            --project "ZhaishengyuanAI" \
-            --product "ZhaishengyuanAI" \
-            --verbose \
-            --android-permissions android.permission.WRITE_EXTERNAL_STORAGE android.permission.READ_EXTERNAL_STORAGE android.permission.INTERNET
+          flet build apk . --org "com.zhaishengyuan" --project "ZhaishengyuanAI" --product "ZhaishengyuanAI" --verbose
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
