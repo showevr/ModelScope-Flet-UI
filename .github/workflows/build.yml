@@ -14,7 +14,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 安装 Linux 系统级依赖 (修复 Linux toolchain 错误)
+      # 安装 Linux 系统级依赖
       - name: Install Linux Dependencies
         run: |
           sudo apt-get update
@@ -48,10 +48,16 @@ jobs:
           flet --version
 
       # 【关键修复】Build APK
-      # 增加了 --permissions 参数，显式声明 写入/读取存储 和 网络权限
+      # 1. 将 --permissions 改为 --android-permissions
+      # 2. 权限列表直接用空格分隔跟在参数后面
       - name: Build APK
         run: |
-          flet build apk . --org "com.zhaishengyuan" --project "ZhaishengyuanAI" --product "ZhaishengyuanAI" --verbose --permissions android.permission.WRITE_EXTERNAL_STORAGE --permissions android.permission.READ_EXTERNAL_STORAGE --permissions android.permission.INTERNET
+          flet build apk . \
+            --org "com.zhaishengyuan" \
+            --project "ZhaishengyuanAI" \
+            --product "ZhaishengyuanAI" \
+            --verbose \
+            --android-permissions android.permission.WRITE_EXTERNAL_STORAGE android.permission.READ_EXTERNAL_STORAGE android.permission.INTERNET
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
