@@ -39,12 +39,6 @@ except AttributeError:
         MyScale = None
 
 # ==========================================
-#      【新增】全局变量 (修复手机端0KB问题)
-# ==========================================
-# 将二进制数据存储在全局作用域，防止在切换 Activity 时因闭包变量回收导致数据丢失
-GLOBAL_PENDING_BYTES = None
-
-# ==========================================
 #      辅助工具函数
 # ==========================================
 def get_opacity_color(opacity, hex_color):
@@ -214,8 +208,9 @@ async def main(page: ft.Page):
     try: page.expand = True 
     except: pass
 
-    # ================= 2. 读取本地存储 =================
+    # ================= 2. 读取本地存储 (修复版：全异步读取) =================
     try:
+        # 【修改】使用 await get_async 确保手机端能读到数据
         stored_api_keys_str = await page.client_storage.get_async("api_keys") or ""
         stored_baidu_config = await page.client_storage.get_async("baidu_config") or ""
         stored_color_name = await page.client_storage.get_async("theme_color") or "Gold"
@@ -239,32 +234,36 @@ async def main(page: ft.Page):
     is_wide_mode = False
     left_panel_visible = True
 
-    # ================= 3. 定义文件保存器 (修复版) =================
+    # ================= 3. 定义文件保存器 (修复版：解决0KB问题) =================
     
+    # 【新增】用于临时存储待下载的二进制数据，不绑定在控件上
+    pending_save_bytes = None
+
     def on_save_file_result(e: ft.FilePickerResultEvent):
-        # 【修改】引用全局变量
-        global GLOBAL_PENDING_BYTES
+        nonlocal pending_save_bytes
         if e.path:
             try:
-                # 【修改】从全局变量读取数据
-                if GLOBAL_PENDING_BYTES:
+                # 【修改】增加 flush 和 fsync 确保手机端写入物理硬盘
+                if pending_save_bytes:
                     with open(e.path, "wb") as f:
-                        f.write(GLOBAL_PENDING_BYTES)
-                        # 【新增】强制刷入磁盘，防止0KB
-                        f.flush()
-                        os.fsync(f.fileno())
+                        f.write(pending_save_bytes)
+                        f.flush()              # 强制清空缓冲区
+                        os.fsync(f.fileno())   # 强制写入物理存储设备
                     
                     page.snack_bar = ft.SnackBar(ft.Text(f"✅ 图片已保存"), open=True)
-                    # 保留数据以防万一，下次下载时会覆盖
+                    # 保存后清空内存
+                    pending_save_bytes = None
                 else:
-                     page.snack_bar = ft.SnackBar(ft.Text(f"❌ 保存失败：数据丢失(请重试)"), open=True, bgcolor="red")
+                     page.snack_bar = ft.SnackBar(ft.Text(f"❌ 保存失败：数据丢失"), open=True, bgcolor="red")
                 
                 page.update()
             except Exception as ex:
-                page.snack_bar = ft.SnackBar(ft.Text(f"保存文件失败: {ex}"), open=True, bgcolor="red")
+                print(f"Write Error: {ex}")
+                page.snack_bar = ft.SnackBar(ft.Text(f"保存文件失败 (权限或路径错误): {ex}"), open=True, bgcolor="red")
                 page.update()
         else:
-            # 取消保存不清除，防止误操作
+            # 取消保存也清空
+            pending_save_bytes = None
             pass
 
     save_file_picker = ft.FilePicker(on_result=on_save_file_result)
@@ -272,6 +271,7 @@ async def main(page: ft.Page):
 
     # ================= 4. 核心功能函数 =================
 
+    # 【修改】改为异步保存函数
     async def save_config(key, value):
         try: await page.client_storage.set_async(key, value)
         except: pass
@@ -343,12 +343,12 @@ async def main(page: ft.Page):
             page.update()
             return None
 
-    # --- 下载图片逻辑 (修复版) ---
+    # --- 下载图片逻辑 (全平台通用稳健版) ---
     async def download_image(url, metadata=None):
-        # 【修改】引用全局变量
-        global GLOBAL_PENDING_BYTES
+        nonlocal pending_save_bytes
         if not url: return False
         try:
+            # 1. 下载图片数据
             res = await asyncio.to_thread(requests.get, url, timeout=30)
             
             if res.status_code == 200:
@@ -356,9 +356,10 @@ async def main(page: ft.Page):
                 if metadata:
                     image_bytes = add_metadata_to_png(image_bytes, metadata)
                 
-                # 【修改】存入全局变量
-                GLOBAL_PENDING_BYTES = image_bytes
+                # 2. 【修改】将数据存入外部变量，不挂载到控件上
+                pending_save_bytes = image_bytes
                 
+                # 3. 触发保存流程
                 timestamp = int(time.time())
                 filename = f"img_{timestamp}_{random.randint(100,999)}.png"
                 
@@ -529,6 +530,7 @@ async def main(page: ft.Page):
         if 0 <= current_viewer_index < len(current_viewer_metadata):
             meta = current_viewer_metadata[current_viewer_index]
             
+        # 调用新版下载
         await download_image(current_url, metadata=meta)
 
     viewer_dl_btn.on_click = on_viewer_download
@@ -669,6 +671,8 @@ async def main(page: ft.Page):
     def get_all_models():
         custom_models = []
         try:
+            # 这里的 get 暂时不动，因为主要是初始化用，但建议后续也优化，此处主要依赖 stored_custom_models 变量
+            # 由于 stored_custom_models 在 main 开头已经异步读取了，所以这里直接解析变量即可
             custom_text = stored_custom_models
             for line in custom_text.strip().split('\n'):
                 if not line.strip(): continue
@@ -690,6 +694,7 @@ async def main(page: ft.Page):
         multiline=True, min_lines=10, max_lines=15, text_size=12, border_radius=10, 
     )
 
+    # 【修改】变为异步
     async def save_custom_models(e):
         nonlocal stored_custom_models
         text = custom_models_input.value or ""
@@ -1284,6 +1289,7 @@ async def main(page: ft.Page):
         multiline=True, text_size=12, content_padding=10
     )
 
+    # 【修改】变为异步
     async def save_settings(e):
         nonlocal current_api_keys, stored_api_keys_str, stored_baidu_config, current_baidu_appid, current_baidu_key
         stored_api_keys_str = api_keys_field.value
@@ -1307,22 +1313,12 @@ async def main(page: ft.Page):
     settings_dialog.content = ft.Container(width=300, content=ft.Column([api_keys_field, baidu_config_field], tight=True, spacing=10))
     settings_dialog.actions = [ft.TextButton("保存", on_click=save_settings)]
 
-    # ================= 5. 【核心修复】主题选择点击逻辑 =================
-    
     def build_theme_content():
-        # 【修改】使用闭包+page.run_task确保任务调度成功
-        def handle_color_click(name):
-            return lambda e: page.run_task(update_theme, color_name=name)
-
-        def handle_mode_click(mode):
-            return lambda e: page.run_task(update_theme, mode=mode)
-
         def color_dot(name, hex_c):
             is_selected = (hex_c == current_primary_color)
             return ft.Container(
                 width=45, height=45, bgcolor=hex_c, border_radius=22,
-                # 【修改】使用新的事件处理器
-                on_click=handle_color_click(name),
+                on_click=lambda e, n=name: update_theme(color_name=n),
                 border=ft.border.all(3, current_primary_color) if is_selected else None,
                 scale=MyScale(1.1 if is_selected else 1.0) if MyScale else None,
                 animate_scale=MyAnimation(200, "easeOut") if MyAnimation else None
@@ -1335,8 +1331,7 @@ async def main(page: ft.Page):
                 border=ft.border.all(1.5, current_primary_color if is_active else "grey"),
                 border_radius=20,
                 bgcolor=get_opacity_color(0.1, current_primary_color) if is_active else None,
-                # 【修改】使用新的事件处理器
-                on_click=handle_mode_click(mode_val)
+                on_click=lambda e, m=mode_val: update_theme(mode=m)
             )
         return ft.Column([
             ft.Text("莫兰迪色系", size=13, color="grey"),
@@ -1350,6 +1345,7 @@ async def main(page: ft.Page):
             ft.Row([mode_pill("护眼", "warm"), mode_pill("浅色", "light"), mode_pill("深色", "dark")], alignment="start", spacing=10)
         ], spacing=0, horizontal_alignment="start")
 
+    # 【修改】变为异步
     async def update_theme(mode=None, color_name=None):
         nonlocal current_primary_color, stored_mode
         if color_name:
@@ -1721,6 +1717,7 @@ async def main(page: ft.Page):
     nav_container_ref.content = ft.Row([nav_text_ref, ft.Container(expand=True), nav_highlight_ref], alignment="spaceBetween")
     
     switch_t2i_page(0) 
+    # 【修改】初始化调用改为异步等待
     await update_theme(stored_mode, stored_color_name)
     
     await asyncio.sleep(0.5) 
