@@ -14,6 +14,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 1. 新增：安装 Linux 系统级依赖 (修复 Linux toolchain 错误)
+      - name: Install Linux Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -30,22 +36,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 新增步骤：接受 Android 许可证
       - name: Accept Android Licenses
         run: |
           yes | flutter doctor --android-licenses
 
+      # 2. 确保 requirements.txt 纯净 (无乱码) 并安装
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          # 确保 flet 命令行工具已安装
           flet --version
 
+      # 3. 构建 APK (修改点：增加了当前目录 "."，并将产品名暂时改为英文以排除编码问题)
       - name: Build APK
-        # 修改点：在命令最后加上了 "." (代表当前目录)，指明 main.py 的位置
         run: |
-          flet build apk . --org "com.zhaishengyuan" --project "ZhaishengyuanAI" --product "魔塔AI大全" --verbose
+          flet build apk . --org "com.zhaishengyuan" --project "ZhaishengyuanAI" --product "ZhaishengyuanAI" --verbose
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
