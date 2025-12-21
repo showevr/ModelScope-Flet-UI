@@ -41,7 +41,6 @@ except AttributeError:
 # ==========================================
 #      【新增】全局变量 (修复手机端0KB问题)
 # ==========================================
-# 将二进制数据存储在全局作用域
 GLOBAL_PENDING_BYTES = None
 
 # ==========================================
@@ -245,7 +244,6 @@ async def main(page: ft.Page):
         global GLOBAL_PENDING_BYTES
         if e.path:
             try:
-                # 增加数据校验，防止写入空数据
                 if GLOBAL_PENDING_BYTES and len(GLOBAL_PENDING_BYTES) > 0:
                     with open(e.path, "wb") as f:
                         f.write(GLOBAL_PENDING_BYTES)
@@ -254,7 +252,6 @@ async def main(page: ft.Page):
                     
                     page.snack_bar = ft.SnackBar(ft.Text(f"✅ 图片已保存"), open=True)
                 else:
-                    # 如果数据为空，提示用户使用浏览器下载
                     page.snack_bar = ft.SnackBar(ft.Text(f"❌ 保存异常，请使用【浏览器下载】按钮"), open=True, bgcolor="red")
                 
                 page.update()
@@ -308,11 +305,6 @@ async def main(page: ft.Page):
     def copy_text(text):
         page.set_clipboard(text)
         page.snack_bar = ft.SnackBar(ft.Text("已复制到剪贴板"), open=True)
-        page.update()
-
-    def copy_image_src(src):
-        page.set_clipboard(src)
-        page.snack_bar = ft.SnackBar(ft.Text("图片路径已复制"), open=True)
         page.update()
 
     def translate_text(text, to_lang="en"):
@@ -372,21 +364,17 @@ async def main(page: ft.Page):
 
     # ================= UI 引用与组件定义 =================
     
-    # 侧边栏头部
     sidebar_icon_ref = ft.Icon("smart_toy", size=40, color="grey")
     sidebar_title_ref = ft.Text("魔塔AI大全", size=18, weight="bold", color="grey")
     sidebar_subtitle_ref = ft.Text("By_showevr", size=12, color="grey")
     
     nav_highlight_ref = ft.Container(width=4, height=20, border_radius=2)
-    
-    # 【修改】 文生图导航项：增加图标
     nav_icon_ref = ft.Icon("palette", color="grey", size=20) 
     nav_text_ref = ft.Text("文生图", size=16, weight="bold", color="grey")
     
     sidebar_div1 = ft.Divider(height=10, thickness=0.5, color="transparent")
     sidebar_div2 = ft.Divider(height=10, thickness=0.5, color="transparent")
 
-    # 【修改】 导航容器内容布局
     nav_container_ref = ft.Container(
         content=ft.Row([
             ft.Row([nav_icon_ref, ft.Container(width=10), nav_text_ref]), 
@@ -398,7 +386,6 @@ async def main(page: ft.Page):
         animate=MyAnimation(200, "easeOut") if MyAnimation else None
     )
     
-    # 【优化】标题字号改为14
     theme_dialog = ft.AlertDialog(title=ft.Text("显示与主题", weight="bold", size=14), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
     settings_dialog = ft.AlertDialog(title=ft.Text("全局设置", size=14), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
 
@@ -407,17 +394,10 @@ async def main(page: ft.Page):
     def close_viewer(e=None):
         viewer_overlay.visible = False
         viewer_overlay.update()
-        # 只有在图库页且侧边栏未打开时才恢复圆圈按钮
-        if not mask.visible:
-            gallery_control_gesture.visible = True
-            gallery_control_gesture.update()
 
     inner_viewer_img = ft.Image(src="", fit=ft.ImageFit.CONTAIN)
 
-    image_content_wrapper = ft.Container(
-        content=inner_viewer_img,
-        on_click=lambda e: None, 
-    )
+    image_content_wrapper = ft.Container(content=inner_viewer_img, on_click=lambda e: None)
 
     inner_img_container = ft.Container(
         content=image_content_wrapper,
@@ -435,11 +415,7 @@ async def main(page: ft.Page):
             on_click=lambda e: close_viewer(e), 
             clip_behavior=ft.ClipBehavior.NONE 
         ),
-        min_scale=0.1,
-        max_scale=5.0,
-        scale_enabled=True,
-        pan_enabled=True, 
-        expand=True,
+        min_scale=0.1, max_scale=5.0, scale_enabled=True, pan_enabled=True, expand=True,
         boundary_margin=ft.padding.all(5000) 
     )
 
@@ -449,9 +425,7 @@ async def main(page: ft.Page):
     current_viewer_index = 0
     
     viewer_background_container = ft.Container(
-        expand=True, 
-        alignment=ft.alignment.center,
-        content=interactive_viewer
+        expand=True, alignment=ft.alignment.center, content=interactive_viewer
     )
 
     def reset_viewer_zoom(update_ui=True):
@@ -468,14 +442,12 @@ async def main(page: ft.Page):
         interactive_viewer.scale = new_scale
         interactive_viewer.update()
 
-    # 右下角的主下载按钮 (本地保存)
     viewer_dl_btn = ft.IconButton(
-        icon="save_alt", icon_color="white", icon_size=20, tooltip="保存到本地 (可能受权限限制)", bgcolor="transparent"
+        icon="save_alt", icon_color="white", icon_size=20, tooltip="保存到本地", bgcolor="transparent"
     )
 
     viewer_info_prompt = ft.Text("无", selectable=True, size=13, color=current_primary_color)
     viewer_info_neg = ft.Text("无", selectable=True, size=13, color=current_primary_color)
-    
     viewer_title_prompt = ft.Text("Prompt", size=11, weight="bold", color=current_primary_color)
     viewer_title_neg = ft.Text("Negative", size=11, weight="bold", color=current_primary_color)
 
@@ -492,21 +464,13 @@ async def main(page: ft.Page):
 
     viewer_info_container = ft.Container(
         content=viewer_text_col,
-        padding=15,
-        visible=False, 
-        animate_opacity=200,
+        padding=15, visible=False, animate_opacity=200,
         bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.WHITE),
-        blur=ft.Blur(20, 20, ft.BlurTileMode.MIRROR),
-        border_radius=0
+        blur=ft.Blur(20, 20, ft.BlurTileMode.MIRROR), border_radius=0
     )
 
     def toggle_viewer_info(e):
         viewer_info_container.visible = not viewer_info_container.visible
-        if viewer_info_container.visible:
-            btn_info.icon_color = current_primary_color
-        else:
-            btn_info.icon_color = current_primary_color 
-        
         btn_info.update()
         viewer_info_container.update()
     
@@ -521,12 +485,9 @@ async def main(page: ft.Page):
     def on_viewer_stack_tap(e):
         nonlocal last_tap_time, tap_count
         now = time.time()
-        if now - last_tap_time < 0.4:
-            tap_count += 1
-        else:
-            tap_count = 1
+        if now - last_tap_time < 0.4: tap_count += 1
+        else: tap_count = 1
         last_tap_time = now
-
         if tap_count == 3:
             close_viewer()
             tap_count = 0
@@ -536,13 +497,11 @@ async def main(page: ft.Page):
         meta = None
         if 0 <= current_viewer_index < len(current_viewer_metadata):
             meta = current_viewer_metadata[current_viewer_index]
-            
         await download_image(current_url, metadata=meta)
 
     viewer_dl_btn.on_click = on_viewer_download
 
     def update_viewer_dl_btn_state(src):
-        # 始终允许下载，因为是弹出保存框
         viewer_dl_btn.icon = "save_alt"
         viewer_dl_btn.icon_color = current_primary_color 
         viewer_dl_btn.disabled = False
@@ -588,14 +547,9 @@ async def main(page: ft.Page):
         viewer_control_btns.append(btn)
         return btn
     
-    # 【修改】功能按钮组
     btn_info = create_control_btn("info_outline", "显示/隐藏详细信息", toggle_viewer_info)
-    # 移除放大缩小按钮
-    # btn_zoom_in = create_control_btn("zoom_in", "放大", lambda e: adjust_zoom(0.5))
-    # btn_zoom_out = create_control_btn("zoom_out", "缩小", lambda e: adjust_zoom(-0.5))
     btn_reset = create_control_btn("restart_alt", "重置大小", lambda e: reset_viewer_zoom(True))
     
-    # 【修改】将复制按钮改为浏览器下载按钮
     def open_browser_download(e):
         if inner_viewer_img.src:
             page.launch_url(inner_viewer_img.src)
@@ -605,29 +559,14 @@ async def main(page: ft.Page):
     btn_browser_dl = create_control_btn("public", "浏览器下载 (推荐)", open_browser_download)
     btn_close = create_control_btn("close", "关闭", close_viewer)
 
-    # 【修改】工具栏布局
     viewer_controls_row = ft.Row(
-        controls=[
-            btn_info, 
-            btn_reset, 
-            btn_browser_dl, 
-            viewer_dl_btn, 
-            ft.Container(width=1, height=20, bgcolor="white54"), 
-            btn_close
-        ], 
-        alignment=ft.MainAxisAlignment.END, 
-        spacing=5
+        controls=[btn_info, btn_reset, btn_browser_dl, viewer_dl_btn, ft.Container(width=1, height=20, bgcolor="white54"), btn_close], 
+        alignment=ft.MainAxisAlignment.END, spacing=5
     )
 
     viewer_bottom_panel = ft.Container(
-        content=ft.Column([
-            viewer_info_container, 
-            ft.Container(content=viewer_controls_row, padding=5) 
-        ], spacing=0, tight=True),
-        bgcolor=ft.Colors.TRANSPARENT,
-        margin=0,
-        padding=0,
-        on_click=lambda e: None 
+        content=ft.Column([viewer_info_container, ft.Container(content=viewer_controls_row, padding=5)], spacing=0, tight=True),
+        bgcolor=ft.Colors.TRANSPARENT, margin=0, padding=0, on_click=lambda e: None 
     )
 
     viewer_stack_content = ft.Stack([
@@ -638,9 +577,7 @@ async def main(page: ft.Page):
     ], expand=True)
     
     viewer_stack = ft.GestureDetector(
-        on_scroll=on_viewer_scroll,
-        content=viewer_stack_content,
-        expand=True
+        on_scroll=on_viewer_scroll, content=viewer_stack_content, expand=True
     )
 
     viewer_overlay = ft.Container(content=viewer_stack, visible=False, expand=True, bgcolor=BG_DARK, top=0, left=0, right=0, bottom=0)
@@ -685,9 +622,6 @@ async def main(page: ft.Page):
         viewer_bottom_panel.bgcolor = ft.Colors.TRANSPARENT
         viewer_bottom_panel.update()
 
-        gallery_control_gesture.visible = False
-        gallery_control_gesture.update()
-
         viewer_overlay.visible = True
         viewer_overlay.update()
 
@@ -725,11 +659,9 @@ async def main(page: ft.Page):
         page.snack_bar = ft.SnackBar(ft.Text("自定义模型已保存"), open=True)
         page.update()
 
-    # 【优化】字号改小，宽度设为300适应手机
     custom_model_dialog = ft.AlertDialog(
         title=ft.Text("自定义模型", weight="bold", size=14),
-        modal=True,
-        surface_tint_color=ft.Colors.TRANSPARENT,
+        modal=True, surface_tint_color=ft.Colors.TRANSPARENT,
         content=ft.Container(
             width=300, 
             content=ft.Column([
@@ -746,8 +678,7 @@ async def main(page: ft.Page):
     )
 
     def open_custom_model_dialog(e):
-        try:
-            custom_models_input.value = stored_custom_models
+        try: custom_models_input.value = stored_custom_models
         except: pass
         safe_open_dialog(custom_model_dialog)
 
@@ -948,7 +879,6 @@ async def main(page: ft.Page):
     
     size_dropdown_container = ft.Container(content=size_dropdown, height=INPUT_HEIGHT, border=ft.border.all(1, get_border_color()), border_radius=8, expand=True, alignment=ft.alignment.center_left)
     
-    # 【优化】使用 expand=True 让输入框自适应宽度，避免溢出
     custom_size_w = ft.TextField(label="宽度", expand=True, keyboard_type="number", text_size=12, height=40, content_padding=10)
     custom_size_h = ft.TextField(label="高度", expand=True, keyboard_type="number", text_size=12, height=40, content_padding=10)
 
@@ -967,13 +897,10 @@ async def main(page: ft.Page):
             size_dropdown.update()
         safe_close_dialog(custom_size_dialog)
 
-    # 【优化】字号改小，宽度设为300适应手机
     custom_size_dialog = ft.AlertDialog(
-        title=ft.Text("自定义分辨率", size=14),
-        surface_tint_color=ft.Colors.TRANSPARENT,
+        title=ft.Text("自定义分辨率", size=14), surface_tint_color=ft.Colors.TRANSPARENT,
         content=ft.Container(
-            width=300, 
-            padding=ft.padding.symmetric(horizontal=10),
+            width=300, padding=ft.padding.symmetric(horizontal=10),
             content=ft.Row([custom_size_w, ft.Text("x", size=14), custom_size_h], alignment="center")
         ),
         actions=[
@@ -1012,27 +939,18 @@ async def main(page: ft.Page):
 
     results_grid = ft.GridView(expand=True, runs_count=None, max_extent=350, child_aspect_ratio=1.0, spacing=10, run_spacing=10, padding=10)
     
-    # 【新增】双指缩放图库手势逻辑
     def on_gallery_scale_update(e: ft.ScaleUpdateEvent):
-        # 仅在非宽屏模式且有Grid时生效
         if is_wide_mode or not results_grid.visible: return
-        
-        # 简单逻辑：scale > 1.2 (放大/减少列数), scale < 0.8 (缩小/增加列数)
-        # 使用 max_extent 来控制列数效果：
-        # max_extent 大 -> 列少
-        # max_extent 小 -> 列多
         current_extent = results_grid.max_extent or 160
-        
-        if e.scale > 1.05: # 放大操作 -> 列数变少 -> extent 变大
+        if e.scale > 1.05: 
              new_extent = min(400, current_extent + 5)
              results_grid.max_extent = new_extent
              results_grid.update()
-        elif e.scale < 0.95: # 缩小操作 -> 列数变多 -> extent 变小
+        elif e.scale < 0.95: 
              new_extent = max(80, current_extent - 5)
              results_grid.max_extent = new_extent
              results_grid.update()
              
-    # 包裹 GridView 以支持手势
     results_grid_gesture = ft.GestureDetector(
         content=results_grid,
         on_scale_update=on_gallery_scale_update,
@@ -1049,8 +967,8 @@ async def main(page: ft.Page):
 
         meta_overlay = ft.Container(
             visible=False,
-            bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.WHITE), # 半透明白
-            blur=ft.Blur(10, 10, ft.BlurTileMode.MIRROR), # 毛玻璃
+            bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.WHITE), 
+            blur=ft.Blur(10, 10, ft.BlurTileMode.MIRROR), 
             padding=10, alignment=ft.alignment.top_left,
             content=ft.Column([
                 ft.Row([ft.Text("Prompt", size=10, color=current_primary_color, weight="bold"), ft.IconButton("content_copy", icon_size=12, icon_color=current_primary_color, on_click=lambda e: copy_overlay_text(overlay_prompt.value))], alignment="spaceBetween"),
@@ -1070,7 +988,6 @@ async def main(page: ft.Page):
                 meta_overlay.update()
         
         btn_info = ft.IconButton(icon="info_outline", icon_color=current_primary_color, icon_size=18, tooltip="显示提示词", visible=False, on_click=toggle_meta_overlay)
-        # 列表中的小图也可以直接调用浏览器下载
         btn_browser = ft.IconButton(icon="public", icon_color=current_primary_color, icon_size=18, tooltip="浏览器下载", visible=False, on_click=lambda e: page.launch_url(img.src))
         btn_dl = ft.IconButton(icon="save_alt", icon_color=current_primary_color, icon_size=18, tooltip="保存到本地", visible=False)
 
@@ -1237,7 +1154,6 @@ async def main(page: ft.Page):
     page2_content = ft.Container(
         padding=ft.padding.symmetric(horizontal=15, vertical=10),
         expand=True,
-        # 【修改】使用 results_grid_gesture 替代 results_grid
         content=ft.Column([
             results_grid_gesture,
         ], expand=True, spacing=0) 
@@ -1261,7 +1177,6 @@ async def main(page: ft.Page):
     
     nav_btn_menu_icon = ft.Icon("menu", size=24, color="grey")
     nav_btn_menu_text = ft.Text("菜单", size=10, color="grey")
-
     nav_btn_settings_icon = ft.Icon("settings", size=24, color="grey")
     nav_btn_settings_text = ft.Text("设置", size=10, color="grey")
     nav_btn_gallery_icon = ft.Icon("image", size=24, color="grey")
@@ -1271,14 +1186,11 @@ async def main(page: ft.Page):
         toggle_sidebar(False) 
         switch_t2i_page(index)
     
-    # 【修改】菜单按钮点击逻辑：折叠时展开，展开时折叠并跳回设置页(Page 0)
     def on_menu_btn_click(e):
         if mask.visible: 
-            # 如果侧边栏是打开的，则关闭它，并跳转到设置页
             toggle_sidebar(False)
             switch_t2i_page(0)
         else:
-            # 如果侧边栏是关闭的，则打开它
             toggle_sidebar(True)
 
     nav_item_menu = ft.Container(
@@ -1311,19 +1223,38 @@ async def main(page: ft.Page):
         ], alignment="spaceAround", vertical_alignment="center"),
     )
 
-    # 【新增】底部导航栏手势检测
-    def on_bottom_nav_pan(e: ft.DragEndEvent):
-        # 简单的速度判定，水平速度
-        if abs(e.velocity_x) > 300: # 阈值
-            if e.velocity_x < 0: # 左滑 (向右看) -> 去图库
-                 if t2i_page_index == 0: switch_t2i_page(1)
-            else: # 右滑 (向左看) -> 回设置/菜单
-                 if t2i_page_index == 1: switch_t2i_page(0)
-                 elif t2i_page_index == 0: toggle_sidebar(True)
+    # 【修复】底部导航栏滑动切页逻辑
+    bottom_nav_drag_buffer = 0
+
+    def on_bottom_nav_pan_update(e: ft.DragUpdateEvent):
+        nonlocal bottom_nav_drag_buffer
+        bottom_nav_drag_buffer += e.delta_x
+
+    def on_bottom_nav_pan_end(e: ft.DragEndEvent):
+        nonlocal bottom_nav_drag_buffer
+        # 逻辑：左滑 (<-) = 翻向右侧页面 (设置->图库) 或 (侧边栏->设置)
+        # 逻辑：右滑 (->) = 翻向左侧页面 (图库->设置) 或 (设置->侧边栏)
+        
+        # 阈值
+        if bottom_nav_drag_buffer < -50: # 向左滑 (查看右侧内容)
+             if mask.visible: # 如果侧边栏打开，左滑关闭侧边栏回到设置
+                 toggle_sidebar(False)
+             elif t2i_page_index == 0: # 如果在设置页，去图库
+                 switch_t2i_page(1)
+
+        elif bottom_nav_drag_buffer > 50: # 向右滑 (查看左侧内容)
+             if t2i_page_index == 1: # 如果在图库，去设置
+                 switch_t2i_page(0)
+             elif t2i_page_index == 0 and not mask.visible: # 如果在设置且侧边栏没开，去侧边栏
+                 toggle_sidebar(True)
+        
+        # 重置缓冲
+        bottom_nav_drag_buffer = 0
 
     bottom_nav = ft.GestureDetector(
         content=bottom_nav_content,
-        on_pan_end=on_bottom_nav_pan, # 使用 Pan End 来捕获甩动手势
+        on_pan_update=on_bottom_nav_pan_update,
+        on_pan_end=on_bottom_nav_pan_end,
         visible=False
     )
 
@@ -1337,6 +1268,10 @@ async def main(page: ft.Page):
         nonlocal t2i_page_index
         t2i_page_index = index
         
+        # 【重要】切换页面时，强制折叠侧边栏，防止莫兰迪色残留
+        if mask.visible:
+            toggle_sidebar(False)
+
         if index == 0:
             nav_btn_settings_icon.color = current_primary_color
             nav_btn_settings_text.color = current_primary_color
@@ -1344,7 +1279,6 @@ async def main(page: ft.Page):
             nav_btn_gallery_text.color = "grey"
             view_switch_btn.icon = "image"
             view_switch_btn.tooltip = "查看生成结果"
-            # gallery_control_gesture.visible = False # 移除旧逻辑
         else:
             nav_btn_settings_icon.color = "grey"
             nav_btn_settings_text.color = "grey"
@@ -1357,14 +1291,9 @@ async def main(page: ft.Page):
         nav_item_gallery.update()
         view_switch_btn.update()
         
-        # 【修改】控制圆球显示逻辑
-        # 只要不是宽屏模式，且侧边栏没打开，且图片查看器没打开，就一直显示圆球
-        if not is_wide_mode and not mask.visible and not viewer_overlay.visible:
-            gallery_control_gesture.visible = True
-        else:
-            gallery_control_gesture.visible = False
-        gallery_control_gesture.update()
-
+        # 悬浮球始终显示 (除非业务需要隐藏)
+        # 移除所有隐藏逻辑
+        
         if is_wide_mode: return 
         
         page1_container.visible = (index == 0)
@@ -1390,18 +1319,8 @@ async def main(page: ft.Page):
         nav_btn_menu_icon.update()
         nav_btn_menu_text.update()
 
-        # 【修改】侧边栏打开时，隐藏圆球
-        if open_it:
-            gallery_control_gesture.visible = False
-        else:
-            # 侧边栏关闭时，如果不是宽屏且查看器未打开，恢复圆球
-            if not is_wide_mode and not viewer_overlay.visible:
-                gallery_control_gesture.visible = True
-            else:
-                gallery_control_gesture.visible = False
+        # 悬浮球不隐藏
         
-        gallery_control_gesture.update()
-
         if not is_wide_mode:
             if open_it:
                 nav_btn_settings_icon.color = "grey"
@@ -1757,16 +1676,13 @@ async def main(page: ft.Page):
         ]
     )
     
-    # 手机端显示的简单圆图标 (无菜单点击事件)
     gallery_simple_icon = ft.Icon(name="circle_outlined", size=30, color=current_primary_color)
 
     gallery_control_btn_container = ft.Container(
-        # 内容将在 update_gallery_controller_content 中动态设置
         content=None,
         bgcolor="transparent", 
     )
     
-    # 【修改】更新控制器的内容 (PC显示菜单，手机显示图标)
     def update_gallery_controller_content():
         if is_wide_mode:
              gallery_control_btn_container.content = gallery_popup_menu
@@ -1774,31 +1690,73 @@ async def main(page: ft.Page):
              gallery_simple_icon.color = current_primary_color
              gallery_control_btn_container.content = gallery_simple_icon
     
+    # 【重写】悬浮球拖动逻辑：侧边栏 <-> 设置 <-> 图库 (无限循环)
+    gallery_drag_accum_x = 0
+    gallery_gesture_triggered = False
+
     def on_gallery_btn_pan(e: ft.DragUpdateEvent):
-        # 通用：更新位置 (Y轴反向)
-        gallery_control_gesture.bottom = max(0, (gallery_control_gesture.bottom or 0) - e.delta_y)
+        nonlocal gallery_drag_accum_x, gallery_gesture_triggered
         
-        # 【新增】手机端横向滑动逻辑
-        if not is_wide_mode:
-            # 检测较大的水平位移来触发页面切换
-            if e.delta_x < -15: # 快速左滑 -> 进图库
-                if t2i_page_index == 0: switch_t2i_page(1)
-            elif e.delta_x > 15: # 快速右滑 -> 回设置
-                if t2i_page_index == 1: switch_t2i_page(0)
-            # 手机端不改变 left 位置，保持在左侧，像个侧边拉手
-            gallery_control_gesture.left = 20
-        else:
-            # PC端保持自由移动
-            gallery_control_gesture.left = max(0, (gallery_control_gesture.left or 0) + e.delta_x)
-            
+        # 1. 自由移动 (限制在屏幕内)
+        current_left = gallery_control_gesture.left or 20
+        current_bottom = gallery_control_gesture.bottom or 100
+        safe_w = page.width if page.width else 360
+        safe_h = page.height if page.height else 640
+        
+        gallery_control_gesture.left = max(0, min(safe_w - 50, current_left + e.delta_x))
+        gallery_control_gesture.bottom = max(0, min(safe_h - 50, current_bottom - e.delta_y))
         gallery_control_gesture.update()
+        
+        # 2. 循环切页逻辑
+        if not gallery_gesture_triggered:
+            gallery_drag_accum_x += e.delta_x
+            threshold = 10 
+            
+            # --- 向左滑 ( <- ) 逻辑：侧边栏(关) -> 设置 -> 图库 -> 侧边栏(开) ---
+            if gallery_drag_accum_x < -threshold: 
+                if mask.visible:
+                    # 侧边栏开着 -> 关掉 (回到设置)
+                    toggle_sidebar(False)
+                    gallery_gesture_triggered = True
+                elif t2i_page_index == 0:
+                    # 在设置页 -> 去图库
+                    switch_t2i_page(1)
+                    gallery_gesture_triggered = True
+                elif t2i_page_index == 1:
+                    # 【循环点】在图库 -> 这里的“下一步”是打开侧边栏
+                    # 先切回Page 0再打开侧边栏，视觉更自然
+                    switch_t2i_page(0) 
+                    toggle_sidebar(True)
+                    gallery_gesture_triggered = True
+
+            # --- 向右滑 ( -> ) 逻辑：图库 -> 设置 -> 侧边栏(开) -> 图库 ---
+            elif gallery_drag_accum_x > threshold: 
+                if mask.visible:
+                    # 【循环点】侧边栏开着 -> 这里的“上一步”是去图库
+                    toggle_sidebar(False) # 先关侧边栏
+                    switch_t2i_page(1)    # 立即跳到图库
+                    gallery_gesture_triggered = True
+                elif t2i_page_index == 0:
+                    # 在设置页 -> 打开侧边栏
+                    toggle_sidebar(True)
+                    gallery_gesture_triggered = True
+                elif t2i_page_index == 1:
+                    # 在图库 -> 回设置页
+                    switch_t2i_page(0)
+                    gallery_gesture_triggered = True
+
+    def on_gallery_btn_pan_end(e: ft.DragEndEvent):
+        nonlocal gallery_drag_accum_x, gallery_gesture_triggered
+        gallery_drag_accum_x = 0
+        gallery_gesture_triggered = False
 
     gallery_control_gesture = ft.GestureDetector(
         content=gallery_control_btn_container,
         on_pan_update=on_gallery_btn_pan,
+        on_pan_end=on_gallery_btn_pan_end,
         left=20,
         bottom=100,
-        visible=False
+        visible=True 
     )
 
     # ==========================================
