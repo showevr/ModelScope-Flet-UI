@@ -466,106 +466,169 @@ async def main(page: ft.Page):
     preload_viewer_img = ft.Image(src="", fit=ft.ImageFit.CONTAIN, gapless_playback=True, opacity=1)
 
     # --- 2. 核心缩放交互层 (底层 - 负责缩放后的漫游) ---
+    
+    # 【新增】模式切换提示胶囊 (Toast)
+    zoom_hint_text = ft.Text("大图模式", color="white", size=14, weight="bold")
+    zoom_hint_container = ft.Container(
+        content=zoom_hint_text,
+        bgcolor=get_opacity_color(0.7, current_primary_color), 
+        padding=ft.padding.symmetric(horizontal=20, vertical=10),
+        border_radius=30,
+        opacity=0, 
+        animate_opacity=300, 
+        visible=False,
+        shadow=ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.3, "black"))
+    )
+
+    # 【新增】触发提示显示的异步任务
+    async def show_zoom_hint_task(text):
+        # 1. 设置内容和颜色 (确保颜色是最新的)
+        zoom_hint_text.value = text
+        zoom_hint_container.bgcolor = get_opacity_color(0.7, current_primary_color)
+        
+        # 2. 显示
+        zoom_hint_container.visible = True
+        zoom_hint_container.opacity = 1
+        zoom_hint_container.update()
+        
+        # 3. 停留 0.5 秒
+        await asyncio.sleep(0.5)
+        
+        # 4. 渐隐
+        zoom_hint_container.opacity = 0
+        zoom_hint_container.update()
+        
+        # 5. 等待动画结束彻底隐藏
+        await asyncio.sleep(0.3)
+        zoom_hint_container.visible = False
+        zoom_hint_container.update()
+
+    # 【新增】辅助调用函数
+    def trigger_zoom_hint(text):
+        page.run_task(show_zoom_hint_task, text)
+
+    # 【修改后的】手机端模式切换逻辑
+    is_mobile_zoom_mode = False
+
+    def toggle_mobile_zoom_mode(enable):
+        nonlocal is_mobile_zoom_mode
+        is_mobile_zoom_mode = enable
+        
+        outer_gesture_detector.visible = not enable
+        
+        if enable:
+            interactive_viewer.scale = 1.1
+            prev_btn.visible = False
+            next_btn.visible = False
+            # 【新增】触发进入提示
+            trigger_zoom_hint("大图模式")
+        else:
+            interactive_viewer.scale = 1.0
+            if is_wide_mode:
+                prev_btn.visible = True
+                next_btn.visible = True
+            # 【新增】触发退出提示
+            trigger_zoom_hint("退出缩放")
+        
+        try:
+            outer_gesture_detector.update()
+            interactive_viewer.update()
+            prev_btn.update()
+            next_btn.update()
+        except: pass
+
+    
+    # 底层双击（只有在 Overlay 隐藏/缩放模式下才能被触发）
     def on_inner_double_tap(e):
-        reset_viewer_zoom(True)
+        if is_wide_mode:
+            reset_viewer_zoom(True)
+        else:
+            # 手机端：双击退出缩放模式，恢复翻页功能
+            toggle_mobile_zoom_mode(False)
 
     inner_gesture = ft.GestureDetector(
-        # 【关键修复A】给图片包一层 Container 并居中，防止查看器铺满屏幕后图片跑偏
+        # 给图片包一层 Container 并居中
         content=ft.Container(
             content=inner_viewer_img,
             alignment=ft.alignment.center, 
             expand=True 
         ),
         on_double_tap=on_inner_double_tap,
-        expand=True # 让手势区域也撑满
+        expand=True 
     )
 
     interactive_viewer = ft.InteractiveViewer(
         key="iv_viewer", 
         content=inner_gesture, 
-        min_scale=1.0, 
+        min_scale=0.2, 
         max_scale=5.0, 
         scale_enabled=True, 
         pan_enabled=True,      
         expand=True,
-        boundary_margin=ft.padding.all(0)
+        boundary_margin=ft.padding.all(800)
     )
 
     # --- 3. 滑动容器层 ---
-    # 当前图片容器
     swipe_anim_container = ft.Container(
         content=interactive_viewer,
         offset=MyOffset(0, 0) if MyOffset else None,
         animate_offset=MyAnimation(300, "easeOut") if MyAnimation else None,
-        # 【关键修复B】删除了 alignment=ft.alignment.center
-        # 这样 InteractiveViewer 就能占满全屏，放大时就不会被裁剪了
         expand=True,
         on_click=lambda e: toggle_overlay_ui(e)
     )
 
-    # 预加载容器 (默认在屏幕右侧隐藏)
     preload_container = ft.Container(
         content=preload_viewer_img,
-        offset=MyOffset(1, 0) if MyOffset else None, # 初始位置在右侧屏幕外
+        offset=MyOffset(1, 0) if MyOffset else None, 
         animate_offset=MyAnimation(300, "easeOut") if MyAnimation else None,
         alignment=ft.alignment.center,
         expand=True,
         visible=False 
     )
 
-    # --- 4. 顶层手势检测 (负责翻页 + 鼠标滚轮 + 缩放接力) ---
+    # --- 4. 顶层手势检测 (负责翻页 + 宽屏鼠标滚轮) ---
     
-    # 核心控制逻辑：切换缩放状态
-    def toggle_zoom_state(target_scale, force_layer_switch=False):
-        nonlocal viewer_zoom_level
-        viewer_zoom_level = target_scale
-        
-        # 同步缩放值给底层
-        interactive_viewer.scale = target_scale
-        
-        if target_scale > 1.05 or force_layer_switch:
-            # === 进入放大模式 ===
-            # 隐藏顶层遮罩，让底层的 InteractiveViewer 全权接管 (支持漫游、原生缩放)
-            outer_gesture_detector.visible = False 
-        else:
-            # === 回到默认模式 ===
-            interactive_viewer.scale = 1.0
-            outer_gesture_detector.visible = True # 恢复顶层遮罩以支持翻页
-            if MyOffset: swipe_anim_container.offset = MyOffset(0, 0)
-        
-        try:
-            interactive_viewer.update()
-            outer_gesture_detector.update()
-            if MyOffset: swipe_anim_container.update()
-        except: pass
-
+    # 顶层双击（默认模式下触发）
     def on_outer_double_tap(e):
-        reset_viewer_zoom(True)
+        if is_wide_mode:
+            reset_viewer_zoom(True)
+        else:
+            # 手机端：双击进入缩放模式，隐藏遮罩
+            toggle_mobile_zoom_mode(True)
 
-    # 【新增】鼠标滚轮支持
+    # 【分离优化】鼠标滚轮 - 仅宽屏/桌面模式生效
     def on_outer_scroll(e: ft.ScrollEvent):
-        # 如果是向上滚动 (zoom in)，通常 delta_y < 0 或根据系统不同
-        # 这里做一个简单的判断，只要滚动就激活放大模式
-        if e.scroll_delta_y < 0 or e.scroll_delta_y > 0:
-            # 只要检测到滚轮意图，立刻切换到底层，并给一个初始放大倍率
-            toggle_zoom_state(1.2, force_layer_switch=True)
+        if not is_wide_mode: return # 手机端禁用滚轮逻辑，防止冲突
+        
+        # 桌面端简单逻辑：滚动即放大
+        if e.scroll_delta_y != 0:
+            if interactive_viewer.scale < 1.1:
+                 interactive_viewer.scale = 1.2
+                 outer_gesture_detector.visible = False # 桌面端保持原有逻辑
+                 try: 
+                     interactive_viewer.update()
+                     outer_gesture_detector.update()
+                 except: pass
 
-    # 【优化】缩放接力 - 手势更新时
+    # 【分离优化】双指缩放更新 - 仅宽屏/桌面模式生效
     def on_outer_scale_update(e: ft.ScaleUpdateEvent):
-        # 当在顶层进行双指缩放时，实时修改底层的缩放值，产生“预览”效果
-        # e.scale 是相对于手势开始时的比例 (开始时是1.0)
+        if not is_wide_mode: return # 手机端完全交给底层原生处理，此处不干扰
+        
         current_preview_scale = max(1.0, e.scale)
         interactive_viewer.scale = current_preview_scale
         try: interactive_viewer.update()
         except: pass
 
-    # 【优化】缩放接力 - 手势结束时
+    # 【分离优化】双指缩放结束 - 仅宽屏/桌面模式生效
     def on_outer_scale_end(e: ft.ScaleEndEvent):
-        # 如果手松开时，放大倍率已经明显大于1，则正式切换到底层模式
+        if not is_wide_mode: return
+        
         if interactive_viewer.scale > 1.1:
-            toggle_zoom_state(interactive_viewer.scale, force_layer_switch=True)
+            # 桌面端：切换到底层
+            outer_gesture_detector.visible = False
+            try: outer_gesture_detector.update()
+            except: pass
         else:
-            # 否则弹回原样
             reset_viewer_zoom()
 
     def on_outer_pan_update(e: ft.DragUpdateEvent):
@@ -576,10 +639,8 @@ async def main(page: ft.Page):
         width = page.width if page.width and page.width > 0 else 360
         _viewer_drag_offset_x += e.delta_x
         
-        # 计算偏移比例
         ratio = _viewer_drag_offset_x / width
         
-        # --- 核心逻辑：拖动时禁用动画，实现跟手 ---
         if MyOffset:
             swipe_anim_container.animate_offset = None 
             swipe_anim_container.offset = MyOffset(ratio, 0)
@@ -591,10 +652,10 @@ async def main(page: ft.Page):
             target_index = -1
             preload_start_x = 0.0
             
-            if _viewer_drag_offset_x < 0: # 向左滑，显示下一张
+            if _viewer_drag_offset_x < 0: 
                 target_index = current_viewer_index + 1
                 preload_start_x = 1.0 
-            else: # 向右滑，显示上一张
+            else: 
                 target_index = current_viewer_index - 1
                 preload_start_x = -1.0
             
@@ -616,7 +677,6 @@ async def main(page: ft.Page):
         width = page.width if page.width and page.width > 0 else 360
         threshold = 60
         
-        # --- 核心逻辑：松手时恢复动画 ---
         anim = MyAnimation(300, "easeOut") if MyAnimation else None
         swipe_anim_container.animate_offset = anim
         preload_container.animate_offset = anim
@@ -625,7 +685,6 @@ async def main(page: ft.Page):
         should_switch_next = (_viewer_drag_offset_x < -threshold) or (velocity < -500)
         should_switch_prev = (_viewer_drag_offset_x > threshold) or (velocity > 500)
 
-        # 【关键修改】这里改为 await 调用新的异步切换函数
         if should_switch_next and current_viewer_index < len(current_viewer_grid_images) - 1:
             await navigate_viewer(1)
         elif should_switch_prev and current_viewer_index > 0:
@@ -656,20 +715,21 @@ async def main(page: ft.Page):
         on_double_tap=on_outer_double_tap,
         on_pan_update=on_outer_pan_update,
         on_pan_end=on_outer_pan_end,
-        on_scroll=on_outer_scroll,           # 【修复】添加滚轮监听
-        on_scale_update=on_outer_scale_update, # 【修复】添加缩放更新监听
-        on_scale_end=on_outer_scale_end,     # 【修复】添加缩放结束监听
+        on_scroll=on_outer_scroll,           
+        on_scale_update=on_outer_scale_update, 
+        on_scale_end=on_outer_scale_end,     
         expand=True,
         visible=True 
     )
 
     def reset_viewer_zoom(update_ui=True):
-        nonlocal viewer_zoom_level, _viewer_drag_offset_x
+        nonlocal viewer_zoom_level, _viewer_drag_offset_x, is_mobile_zoom_mode
         viewer_zoom_level = 1.0
         _viewer_drag_offset_x = 0.0
+        is_mobile_zoom_mode = False # 重置手机缩放状态
         
         interactive_viewer.scale = 1.0
-        outer_gesture_detector.visible = True # 恢复顶层
+        outer_gesture_detector.visible = True 
         preload_container.visible = False
         
         if MyOffset:
@@ -687,14 +747,17 @@ async def main(page: ft.Page):
 
     current_viewer_grid_images = [] 
     current_viewer_index = 0
-    is_animating = False # 【新增】防止动画冲突的状态锁
+    is_animating = False 
     
     # 背景容器 (Stack 布局)
     viewer_image_stack_content = ft.Stack([
-        preload_container,       # Layer 0: 预加载层 (底下)
-        swipe_anim_container,    # Layer 1: 当前图片显示层 (包含InteractiveViewer)
-        outer_gesture_detector   # Layer 2: 手势捕获层 (负责翻页和初始缩放)
-    ], expand=True)
+        preload_container,       
+        swipe_anim_container,    
+        outer_gesture_detector,
+        # 【最终修复】直接将提示胶囊放入 Stack，利用 Stack 的 alignment 属性居中
+        # 这样提示胶囊只占据自身大小的空间，不会遮挡周围的触摸区域
+        zoom_hint_container  
+    ], expand=True, alignment=ft.alignment.center) # <--- 关键：设置 Stack 内容居中对齐
 
     viewer_background_container = ft.Container(
         expand=True, alignment=ft.alignment.center, content=viewer_image_stack_content
@@ -855,9 +918,15 @@ async def main(page: ft.Page):
         is_animating = False
         _viewer_drag_offset_x = 0
 
-    # 左右翻页按钮 (仅横屏) - 【修改】增加 page.run_task 调用异步函数
-    prev_btn = ft.IconButton("chevron_left", icon_color="white", icon_size=30, bgcolor=get_opacity_color(0.3, "black"), on_click=lambda e: page.run_task(navigate_viewer, -1), visible=False, tooltip="上一张")
-    next_btn = ft.IconButton("chevron_right", icon_color="white", icon_size=30, bgcolor=get_opacity_color(0.3, "black"), on_click=lambda e: page.run_task(navigate_viewer, 1), visible=False, tooltip="下一张")
+    # 左右翻页按钮 (仅横屏) - 【修复】使用标准的 async wrapper 确保点击生效
+    async def on_prev_click(e):
+        await navigate_viewer(-1)
+
+    async def on_next_click(e):
+        await navigate_viewer(1)
+
+    prev_btn = ft.IconButton("chevron_left", icon_color="white", icon_size=30, bgcolor=get_opacity_color(0.3, "black"), on_click=on_prev_click, visible=False, tooltip="上一张")
+    next_btn = ft.IconButton("chevron_right", icon_color="white", icon_size=30, bgcolor=get_opacity_color(0.3, "black"), on_click=on_next_click, visible=False, tooltip="下一张")
     
     # 【关键修改】Viewer Stack布局重构，确保info overlay不影响image stack
     # 这里定义各个独立的Container，后面在 update_viewer_layout_content 组装
@@ -1430,24 +1499,49 @@ async def main(page: ft.Page):
     size_row = ft.Row([size_dropdown_container, custom_size_btn], spacing=5)
 
     def create_slider_row(label, min_v, max_v, def_v, step=1):
-        slider = ft.Slider(min=min_v, max=max_v, divisions=None, value=def_v, label="{value}", expand=True, active_color=current_primary_color)
-        val_text = ft.Text(str(def_v), width=35, size=12, text_align="center")
+        # nb_divisions = int((max_v - min_v) / step) # 【已注释】不再计算分段，从而隐藏刻度点
+
+        slider = ft.Slider(
+            min=min_v, 
+            max=max_v, 
+            # divisions=nb_divisions, # 【已注释】去掉此行，从而隐藏滑块背后的圆点
+            value=def_v, 
+            label="{value}", 
+            expand=True, 
+            active_color=current_primary_color
+        )
+        
+        val_text = ft.Text(str(def_v), width=40, size=14, text_align="center")
+
         def on_change(e):
-            val_text.value = str(round(e.control.value, 1) if step < 1 else int(e.control.value))
+            # === 【核心修复逻辑】 ===
+            # 虽然滑块是平滑的，但我们在显示时手动算回最近的步进值
+            # 算法：(当前值 / 步长) 四舍五入取整 * 步长
+            raw_val = e.control.value
+            snapped_val = round(raw_val / step) * step
+            
+            if step < 1:
+                # 如果是小数步进（如引导系数 0.5），保留一位小数
+                val_text.value = f"{snapped_val:.1f}"
+            else:
+                # 如果是整数步进（如步数 1），直接转整数
+                val_text.value = str(int(snapped_val))
+                
             val_text.update()
+            
         slider.on_change = on_change
-        return ft.Row([ft.Text(label, size=12, width=60, color="grey"), slider, val_text], alignment="center", vertical_alignment="center"), slider, val_text
+        return ft.Row([ft.Text(label, size=14, width=60, color="grey"), slider, val_text], alignment="center", vertical_alignment="center"), slider, val_text
 
     initial_key_count = max(1, len(current_api_keys))
     batch_row, batch_slider, batch_val_text = create_slider_row("生图数量", 1, max(1, initial_key_count), initial_key_count)
-    steps_row, steps_slider, steps_val_text = create_slider_row("生图步数", 1, 100, 30) 
-    guidance_row, guidance_slider, guidance_val_text = create_slider_row("引导系数", 1, 20, 3.5, 0.1) 
+    steps_row, steps_slider, steps_val_text = create_slider_row("生图步数", 5, 100, 30, 5) 
+    guidance_row, guidance_slider, guidance_val_text = create_slider_row("引导系数", 1, 20, 3.5, 0.5) 
 
     seed_input = ft.TextField(
         value="-1", text_size=12, height=INPUT_HEIGHT, content_padding=ft.padding.symmetric(horizontal=10, vertical=0),
         border_radius=8, bgcolor="transparent", border_color=get_border_color(), border_width=1, keyboard_type="number", expand=True
     )
-    seed_row = ft.Row([ft.Text("随机种子", size=12, width=60, color="grey"), seed_input], alignment="center", vertical_alignment="center")
+    seed_row = ft.Row([ft.Text("随机种子", size=14, width=60, color="grey"), seed_input], alignment="center", vertical_alignment="center")
 
     generate_btn = ft.ElevatedButton(
         "开始生成", icon="brush", bgcolor=current_primary_color, color="white", height=50, style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)), width=float("inf")
@@ -1472,27 +1566,32 @@ async def main(page: ft.Page):
         results_grid.runs_count = None 
 
     def on_gallery_scale_update(e: ft.ScaleUpdateEvent):
-        """手势更新：乘法计算 + 性能节流"""
+        """手势更新：优化版（防抖动+降低频率）"""
         nonlocal _last_update_timestamp
         
         # 1. 宽屏或未显示时不处理
         if is_wide_mode or not results_grid.visible: 
             return
 
-        # 2. 性能节流 (Throttling)：防止每秒上百次刷新卡死界面
+        # 2. 【核心优化】增加“死区”判断 (Deadzone)
+        # 防止手指微小抖动触发重绘，只有缩放幅度变化超过 2% 才处理
+        if abs(e.scale - 1) < 0.02:
+            return
+
+        # 3. 【核心优化】降低刷新频率 (Throttling)
+        # 从 0.02s(50fps) 降低到 0.05s(20fps)，大幅减少卡顿
         now = time.time()
-        if now - _last_update_timestamp < 0.02: # 20ms 间隔 (约50fps)
+        if now - _last_update_timestamp < 0.05: 
             return
         _last_update_timestamp = now
 
-        # 3. 核心算法：使用乘法 (e.scale 是相对于手势开始时的比例)
-        # 例如：手指张开 1.5 倍，图片就变大 1.5 倍，完全线性跟手
+        # 4. 核心算法
         new_extent = _gesture_start_extent * e.scale
         
-        # 4. 限制缩放范围 (80=约4列, 600=超大单图)
+        # 5. 限制缩放范围
         clamped_extent = max(80, min(600, new_extent))
         
-        # 5. 应用更新
+        # 6. 应用更新
         results_grid.max_extent = clamped_extent
         results_grid.update()
              
@@ -2073,7 +2172,14 @@ async def main(page: ft.Page):
         if color_name:
             hex_val = MORANDI_COLORS[color_name]
             current_primary_color = hex_val
-            page.theme = ft.Theme(color_scheme_seed=hex_val)
+            page.theme = ft.Theme(
+                color_scheme_seed=hex_val,
+                slider_theme=ft.SliderTheme(
+                    active_tick_mark_color=ft.Colors.TRANSPARENT,
+                    inactive_tick_mark_color=ft.Colors.TRANSPARENT
+                )
+            )
+            
             await save_config("theme_color", color_name)
             generate_btn.bgcolor = hex_val
             
@@ -2156,6 +2262,11 @@ async def main(page: ft.Page):
             try: viewer_dl_btn.update()
             except: pass
             try: btn_browser_dl.update()
+            except: pass  # 补全这个 except
+            
+            # 更新提示胶囊颜色
+            zoom_hint_container.bgcolor = get_opacity_color(0.7, hex_val)
+            try: zoom_hint_container.update()
             except: pass
 
         if mode:
