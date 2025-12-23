@@ -14,7 +14,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. 新增：安装 Linux 系统级依赖 (修复 Linux toolchain 错误)
       - name: Install Linux Dependencies
         run: |
           sudo apt-get update
@@ -40,17 +39,15 @@ jobs:
         run: |
           yes | flutter doctor --android-licenses
 
-      # 2. 确保 requirements.txt 纯净 (无乱码) 并安装
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
           flet --version
 
-      # 3. 构建 APK (修改点：增加了当前目录 "."，并将产品名暂时改为英文以排除编码问题)
       - name: Build APK
         run: |
-          flet build apk . --org "com.zhaishengyuan" --project "ZhaishengyuanAI" --product "MotaAI" --verbose
+          flet build apk . --org "com.motaai" --project "motaai" --product "MotaAI" --icon "icon.png" --splash "splash.png" --splash-color "#03060b" --verbose
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
