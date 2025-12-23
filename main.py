@@ -46,7 +46,7 @@ except AttributeError:
 #      【新增】本地微型图片服务器 (解决0KB问题)
 # ==========================================
 LOCAL_IMAGE_CACHE = {}
-LOCAL_SERVER_PORT = 28989  # 选择一个不容易冲突的端口
+LOCAL_SERVER_PORT = 28989 
 
 class LocalImageHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
