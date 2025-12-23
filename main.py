@@ -2583,7 +2583,7 @@ async def main(page: ft.Page):
             toggle_panel_btn.visible = False
             bottom_nav.visible = True 
 
-            custom_appbar.height = 5 
+            custom_appbar.height = 35 
             
             page1_container.visible = (t2i_page_index == 0)
             page1_container.expand = True 
@@ -2644,10 +2644,12 @@ async def main(page: ft.Page):
     page.on_resize = on_resize
 
     custom_appbar = ft.Container(
-        # 1. 这里的 height 只是初始值，会被 on_resize 覆盖，改不改影响不大，建议改为 70
-        height=70, 
-        # 2. 修改这里：加入 top=30 (根据你的手机刘海高度调整，30-40通常比较合适)
-        padding=ft.padding.only(left=10, right=10, top=10),
+        height=50, # 这里的数值可能不需要动，或者根据视觉微调
+        # === 核心修改在这里 ===
+        # 1. margin 设置为负数，把内容强行往上提，进入 SafeArea 预留的空白区
+        margin=ft.margin.only(top=-15), 
+        
+        padding=ft.padding.only(left=10, right=10), # 内部 padding 保持原样
         content=ft.Row([
             top_menu_btn,
             toggle_panel_btn,
@@ -2672,7 +2674,7 @@ async def main(page: ft.Page):
                 bottom_nav 
             ], spacing=0),
             bottom=True, # 自动避开底部横条
-            top=False     # 关闭自动避开顶部刘海/状态栏
+            top=True     # 自动避开顶部刘海/状态栏
         )
     )
     
