@@ -2583,7 +2583,7 @@ async def main(page: ft.Page):
             toggle_panel_btn.visible = False
             bottom_nav.visible = True 
 
-            custom_appbar.height = 35 
+            custom_appbar.height = 5 
             
             page1_container.visible = (t2i_page_index == 0)
             page1_container.expand = True 
@@ -2644,7 +2644,10 @@ async def main(page: ft.Page):
     page.on_resize = on_resize
 
     custom_appbar = ft.Container(
-        height=50, padding=ft.padding.only(left=10, right=10),
+        # 1. 这里的 height 只是初始值，会被 on_resize 覆盖，改不改影响不大，建议改为 70
+        height=70, 
+        # 2. 修改这里：加入 top=30 (根据你的手机刘海高度调整，30-40通常比较合适)
+        padding=ft.padding.only(left=10, right=10, top=10),
         content=ft.Row([
             top_menu_btn,
             toggle_panel_btn,
@@ -2669,7 +2672,7 @@ async def main(page: ft.Page):
                 bottom_nav 
             ], spacing=0),
             bottom=True, # 自动避开底部横条
-            top=True     # 自动避开顶部刘海/状态栏
+            top=False     # 关闭自动避开顶部刘海/状态栏
         )
     )
     
