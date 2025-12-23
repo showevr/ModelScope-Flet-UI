@@ -2583,7 +2583,7 @@ async def main(page: ft.Page):
             toggle_panel_btn.visible = False
             bottom_nav.visible = True 
 
-            custom_appbar.height = 15 
+            custom_appbar.height = 25 
             
             page1_container.visible = (t2i_page_index == 0)
             page1_container.expand = True 
