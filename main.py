@@ -455,6 +455,10 @@ async def main(page: ft.Page):
         nonlocal is_viewer_info_open, viewer_zoom_level, _viewer_drag_offset_x
         is_viewer_info_open = False 
         viewer_overlay.visible = False
+        if not is_wide_mode and t2i_page_index == 1:
+            gallery_control_gesture.visible = True
+            gallery_control_gesture.update()
+
         try: viewer_overlay.update()
         except: pass
         reset_viewer_zoom(update_ui=False)
@@ -517,17 +521,19 @@ async def main(page: ft.Page):
         outer_gesture_detector.visible = not enable
         
         if enable:
-            interactive_viewer.scale = 1.1
+            # ======= 进入大图模式 =======
+            interactive_viewer.scale = 1.2
             prev_btn.visible = False
             next_btn.visible = False
-            # 【新增】触发进入提示
+            
+            viewer_controls_container.visible = False
             trigger_zoom_hint("大图模式")
         else:
             interactive_viewer.scale = 1.0
             if is_wide_mode:
                 prev_btn.visible = True
                 next_btn.visible = True
-            # 【新增】触发退出提示
+            viewer_controls_container.visible = True
             trigger_zoom_hint("退出缩放")
         
         try:
@@ -535,15 +541,15 @@ async def main(page: ft.Page):
             interactive_viewer.update()
             prev_btn.update()
             next_btn.update()
+
+            viewer_controls_container.update()
+            update_viewer_layout_content()
         except: pass
 
-    
-    # 底层双击（只有在 Overlay 隐藏/缩放模式下才能被触发）
     def on_inner_double_tap(e):
         if is_wide_mode:
             reset_viewer_zoom(True)
         else:
-            # 手机端：双击退出缩放模式，恢复翻页功能
             toggle_mobile_zoom_mode(False)
 
     inner_gesture = ft.GestureDetector(
@@ -1207,6 +1213,10 @@ async def main(page: ft.Page):
         update_viewer_layout_content()
         sync_viewer_btns_state()
 
+        if not is_wide_mode:
+            gallery_control_gesture.visible = False
+            gallery_control_gesture.update()
+
         viewer_overlay.visible = True
         viewer_overlay.update()
 
@@ -1537,9 +1547,22 @@ async def main(page: ft.Page):
     steps_row, steps_slider, steps_val_text = create_slider_row("生图步数", 5, 100, 30, 5) 
     guidance_row, guidance_slider, guidance_val_text = create_slider_row("引导系数", 1, 20, 3.5, 0.5) 
 
+    def validate_seed(e):
+        if not seed_input.value or not seed_input.value.strip():
+            seed_input.value = "-1"
+            seed_input.update()
     seed_input = ft.TextField(
-        value="-1", text_size=12, height=INPUT_HEIGHT, content_padding=ft.padding.symmetric(horizontal=10, vertical=0),
-        border_radius=8, bgcolor="transparent", border_color=get_border_color(), border_width=1, keyboard_type="number", expand=True
+        value="-1", 
+        text_size=12, 
+        height=INPUT_HEIGHT, 
+        content_padding=ft.padding.symmetric(horizontal=10, vertical=0),
+        border_radius=8, 
+        bgcolor="transparent", 
+        border_color=get_border_color(), 
+        border_width=1, 
+        keyboard_type="number", 
+        expand=True,
+        on_blur=validate_seed  
     )
     seed_row = ft.Row([ft.Text("随机种子", size=14, width=60, color="grey"), seed_input], alignment="center", vertical_alignment="center")
 
@@ -1548,59 +1571,6 @@ async def main(page: ft.Page):
     )
 
     results_grid = ft.GridView(expand=True, runs_count=None, max_extent=350, child_aspect_ratio=1.0, spacing=10, run_spacing=10, padding=10)
-    
-    # ==========================================
-    #      【优化版】安卓原生级丝滑缩放逻辑
-    # ==========================================
-    
-    # 缩放基准状态记录
-    _gesture_start_extent = 160
-    _last_update_timestamp = 0
-
-    def on_gallery_scale_start(e: ft.ScaleStartEvent):
-        """手势开始：记录初始网格大小，实现'跟手'的核心"""
-        nonlocal _gesture_start_extent
-        # 记录手指刚放上去时的当前尺寸
-        _gesture_start_extent = results_grid.max_extent or 160
-        # 强制解除固定列数模式，确保 max_extent 生效
-        results_grid.runs_count = None 
-
-    def on_gallery_scale_update(e: ft.ScaleUpdateEvent):
-        """手势更新：优化版（防抖动+降低频率）"""
-        nonlocal _last_update_timestamp
-        
-        # 1. 宽屏或未显示时不处理
-        if is_wide_mode or not results_grid.visible: 
-            return
-
-        # 2. 【核心优化】增加“死区”判断 (Deadzone)
-        # 防止手指微小抖动触发重绘，只有缩放幅度变化超过 2% 才处理
-        if abs(e.scale - 1) < 0.02:
-            return
-
-        # 3. 【核心优化】降低刷新频率 (Throttling)
-        # 从 0.02s(50fps) 降低到 0.05s(20fps)，大幅减少卡顿
-        now = time.time()
-        if now - _last_update_timestamp < 0.05: 
-            return
-        _last_update_timestamp = now
-
-        # 4. 核心算法
-        new_extent = _gesture_start_extent * e.scale
-        
-        # 5. 限制缩放范围
-        clamped_extent = max(80, min(600, new_extent))
-        
-        # 6. 应用更新
-        results_grid.max_extent = clamped_extent
-        results_grid.update()
-             
-    results_grid_gesture = ft.GestureDetector(
-        content=results_grid,
-        on_scale_start=on_gallery_scale_start,   # 绑定开始事件
-        on_scale_update=on_gallery_scale_update, # 绑定更新事件
-        expand=True
-    )
     
     # ================= 5. 结果卡片 UI (修改版) =================
     
@@ -1723,13 +1693,24 @@ async def main(page: ft.Page):
                 status_ref.color = current_primary_color
                 status_ref.update()
                 headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-                seed_val = int(seed_input.value)
+                raw_seed = seed_input.value
+                if not raw_seed or not raw_seed.strip():
+                    seed_val = -1
+                else:
+                    try:
+                        seed_val = int(raw_seed)
+                    except ValueError:
+                        seed_val = -1 
                 if seed_val == -1: seed_val = random.randint(1, 10000000)
                 current_seed = seed_val + idx 
 
                 payload = {
-                    "model": model_dropdown.value, "prompt": prompt_input.value, "negative_prompt": neg_prompt_input.value,
-                    "size": size_dropdown.value, "num_inference_steps": int(steps_slider.value), "guidance_scale": float(guidance_slider.value),
+                    "model": model_dropdown.value, 
+                    "prompt": prompt_input.value, 
+                    "negative_prompt": neg_prompt_input.value,
+                    "size": size_dropdown.value, 
+                    "num_inference_steps": int(steps_val_text.value),  
+                    "guidance_scale": float(guidance_val_text.value),  
                     "seed": current_seed
                 }
 
@@ -1859,7 +1840,7 @@ async def main(page: ft.Page):
         padding=ft.padding.symmetric(horizontal=15, vertical=10),
         expand=True,
         content=ft.Column([
-            results_grid_gesture,
+            results_grid,  
         ], expand=True, spacing=0) 
     )
 
@@ -1881,8 +1862,12 @@ async def main(page: ft.Page):
     
     nav_btn_menu_icon = ft.Icon("menu", size=24, color="grey")
     nav_btn_menu_text = ft.Text("菜单", size=10, color="grey")
-    nav_btn_settings_icon = ft.Icon("settings", size=24, color="grey")
-    nav_btn_settings_text = ft.Text("设置", size=10, color="grey")
+    
+    # 【改动】这里不再是固定的“设置”，而是动态的“功能按钮”
+    # 默认初始化为“文生图”，后续可以通过代码修改这两个变量来改变图标和文字
+    nav_btn_func_icon = ft.Icon("palette", size=24, color="grey")
+    nav_btn_func_text = ft.Text("文生图", size=10, color="grey")
+    
     nav_btn_gallery_icon = ft.Icon("image", size=24, color="grey")
     nav_btn_gallery_text = ft.Text("图库", size=10, color="grey")
     
@@ -1914,7 +1899,8 @@ async def main(page: ft.Page):
         )
 
     nav_item_menu = create_nav_item(nav_btn_menu_icon, nav_btn_menu_text, on_menu_btn_click)
-    nav_item_settings = create_nav_item(nav_btn_settings_icon, nav_btn_settings_text, lambda e: on_nav_click(0))
+    # 【改动】中间的按钮现在指向 nav_btn_func_...
+    nav_item_func = create_nav_item(nav_btn_func_icon, nav_btn_func_text, lambda e: on_nav_click(0))
     nav_item_gallery = create_nav_item(nav_btn_gallery_icon, nav_btn_gallery_text, lambda e: on_nav_click(1))
 
     bottom_nav_content = ft.Container(
@@ -1924,7 +1910,7 @@ async def main(page: ft.Page):
         border=ft.border.only(top=ft.BorderSide(0.5, "grey")),
         content=ft.Row([
             nav_item_menu,
-            nav_item_settings,
+            nav_item_func, # 使用新的功能按钮
             nav_item_gallery
         ], 
         alignment="start",
@@ -1978,21 +1964,24 @@ async def main(page: ft.Page):
             toggle_sidebar(False)
 
         if index == 0:
-            nav_btn_settings_icon.color = current_primary_color
-            nav_btn_settings_text.color = current_primary_color
+            # 【改动】选中第一页时，高亮中间的功能按钮
+            nav_btn_func_icon.color = current_primary_color
+            nav_btn_func_text.color = current_primary_color
             nav_btn_gallery_icon.color = "grey"
             nav_btn_gallery_text.color = "grey"
             view_switch_btn.icon = "image"
             view_switch_btn.tooltip = "查看生成结果"
         else:
-            nav_btn_settings_icon.color = "grey"
-            nav_btn_settings_text.color = "grey"
+            # 【改动】选中第二页时，灰显中间的功能按钮
+            nav_btn_func_icon.color = "grey"
+            nav_btn_func_text.color = "grey"
             nav_btn_gallery_icon.color = current_primary_color
             nav_btn_gallery_text.color = current_primary_color
             view_switch_btn.icon = "tune"
-            view_switch_btn.tooltip = "返回设置"
+            # 【改动】动态显示返回文本
+            view_switch_btn.tooltip = f"返回{nav_btn_func_text.value}"
             
-        nav_item_settings.update()
+        nav_item_func.update()
         nav_item_gallery.update()
         view_switch_btn.update()
         
@@ -2003,6 +1992,10 @@ async def main(page: ft.Page):
         
         t2i_slider.offset = None 
         
+        if not is_wide_mode:
+            gallery_control_gesture.visible = (index == 1)
+            gallery_control_gesture.update()
+
         page1_container.update()
         page2_container.update()
         t2i_slider.update()
@@ -2023,23 +2016,25 @@ async def main(page: ft.Page):
 
         if not is_wide_mode:
             if open_it:
-                nav_btn_settings_icon.color = "grey"
-                nav_btn_settings_text.color = "grey"
+                # 【改动】侧边栏打开时，中间按钮变灰
+                nav_btn_func_icon.color = "grey"
+                nav_btn_func_text.color = "grey"
                 nav_btn_gallery_icon.color = "grey"
                 nav_btn_gallery_text.color = "grey"
             else:
+                # 【改动】侧边栏关闭时，根据当前页恢复颜色
                 if t2i_page_index == 0:
-                    nav_btn_settings_icon.color = current_primary_color
-                    nav_btn_settings_text.color = current_primary_color
+                    nav_btn_func_icon.color = current_primary_color
+                    nav_btn_func_text.color = current_primary_color
                     nav_btn_gallery_icon.color = "grey"
                     nav_btn_gallery_text.color = "grey"
                 else:
-                    nav_btn_settings_icon.color = "grey"
-                    nav_btn_settings_text.color = "grey"
+                    nav_btn_func_icon.color = "grey"
+                    nav_btn_func_text.color = "grey"
                     nav_btn_gallery_icon.color = current_primary_color
                     nav_btn_gallery_text.color = current_primary_color
             
-            nav_item_settings.update()
+            nav_item_func.update()
             nav_item_gallery.update()
 
 
@@ -2174,6 +2169,7 @@ async def main(page: ft.Page):
             current_primary_color = hex_val
             page.theme = ft.Theme(
                 color_scheme_seed=hex_val,
+                dialog_theme=ft.DialogTheme(surface_tint_color=ft.Colors.TRANSPARENT),
                 slider_theme=ft.SliderTheme(
                     active_tick_mark_color=ft.Colors.TRANSPARENT,
                     inactive_tick_mark_color=ft.Colors.TRANSPARENT
@@ -2330,8 +2326,9 @@ async def main(page: ft.Page):
             settings_dialog.bgcolor = dialog_bg
             custom_model_dialog.bgcolor = dialog_bg
             custom_size_dialog.bgcolor = dialog_bg
+            gallery_popup_menu.bgcolor = dialog_bg 
 
-            bottom_nav_content.bgcolor = sidebar_bg 
+            bottom_nav_content.bgcolor = sidebar_bg
             
             if viewer_overlay.visible:
                 viewer_overlay.bgcolor = viewer_bg
@@ -2430,6 +2427,7 @@ async def main(page: ft.Page):
         icon="circle_outlined",
         icon_size=30,
         tooltip="调整图库布局",
+        surface_tint_color=ft.Colors.TRANSPARENT, 
         items=[
             ft.PopupMenuItem(text="1列 (大图)", on_click=lambda e: set_gallery_columns(1)),
             ft.PopupMenuItem(text="2列", on_click=lambda e: set_gallery_columns(2)),
@@ -2446,31 +2444,41 @@ async def main(page: ft.Page):
     )
     
     def update_gallery_controller_content():
-        if is_wide_mode:
-             gallery_control_btn_container.content = gallery_popup_menu
-        else:
-             gallery_simple_icon.color = current_primary_color
-             gallery_control_btn_container.content = gallery_simple_icon
+        gallery_control_btn_container.content = gallery_popup_menu
     
     def on_gallery_btn_pan(e: ft.DragUpdateEvent):
         safe_w = page.width if page.width else 360
         safe_h = page.height if page.height else 640
 
+        sidebar_w = 0
+        if is_wide_mode:
+             sidebar_w = 300 
+             if safe_w * 0.5 > 300: sidebar_w = safe_w * 0.5 
+             else: sidebar_w = 300
+        
+        min_left = sidebar_w + 10 
+        max_left = safe_w - 60    
+
         if gallery_control_gesture.left is None:
-            current_left = safe_w - 70 
-            gallery_control_gesture.right = None
+            current_left = max_left - 20 
+            gallery_control_gesture.right = None 
         else:
             current_left = gallery_control_gesture.left
 
         current_bottom = gallery_control_gesture.bottom or 100
+
+        new_left = current_left + e.delta_x
+        new_bottom = current_bottom - e.delta_y 
+
+        if new_left < min_left: new_left = min_left
+        if new_left > max_left: new_left = max_left
+
+        min_bottom = 20
+        max_bottom = safe_h - 120 
         
-        min_left_boundary = 0
-        if is_wide_mode and left_panel_visible:
-            min_left_boundary = safe_w * 0.335 
-            
-        new_left = max(min_left_boundary, min(safe_w - 50, current_left + e.delta_x))
-        new_bottom = max(0, min(safe_h - 50, current_bottom - e.delta_y))
-        
+        if new_bottom < min_bottom: new_bottom = min_bottom
+        if new_bottom > max_bottom: new_bottom = max_bottom
+
         gallery_control_gesture.left = new_left
         gallery_control_gesture.bottom = new_bottom
         gallery_control_gesture.update()
@@ -2604,25 +2612,34 @@ async def main(page: ft.Page):
             page1_scroll_col.scroll = ft.ScrollMode.AUTO 
             prompt_input.expand = False 
             
-            # 计算可用空间：屏幕高度 - 固定占用的高度
-            # 占用: Appbar(35+SafeArea) + 底部导航(56) + 底部固定按钮(约70) + 
-            #       其他参数控件预估高度(约460: Model+Neg+Size+Sliders+Seed+Spacing)
-            
-            layout_overhead = 35 + 56 + 70 + 30 
-            reserved_params = 460 
-            
-            target_h = ph - layout_overhead - reserved_params
-            
-            # 最小高度 160，如果空间大就撑大
-            if target_h > 160:
-                prompt_input.height = target_h
-            else:
-                prompt_input.height = 160
+            prompt_input.height = 200
             
             fixed_bottom_action_bar.visible = True
 
         update_gallery_controller_content()
-        gallery_control_gesture.visible = is_wide_mode 
+
+        current_safe_w = pw
+        sidebar_edge = 0
+        if is_wide_mode:
+            sidebar_edge = 300 if pw * 0.5 < 300 else pw * 0.5
+
+        btn_left = gallery_control_gesture.left
+
+        need_reset = False
+        if btn_left is not None:
+            if btn_left < sidebar_edge: need_reset = True 
+            if btn_left > current_safe_w - 50: need_reset = True 
+        
+        if mode_changed or need_reset:
+            gallery_control_gesture.left = None 
+            gallery_control_gesture.right = 20  
+            gallery_control_gesture.bottom = 100 
+            gallery_control_gesture.update()
+
+        if is_wide_mode:
+            gallery_control_gesture.visible = True
+        else:
+            gallery_control_gesture.visible = (t2i_page_index == 1) and (not viewer_overlay.visible)
         
         page1_container.update()
         page2_container.update()
