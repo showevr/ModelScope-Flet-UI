@@ -46,7 +46,7 @@ except AttributeError:
 #      【新增】本地微型图片服务器 (解决0KB问题)
 # ==========================================
 LOCAL_IMAGE_CACHE = {}
-LOCAL_SERVER_PORT = 28989 
+LOCAL_SERVER_PORT = 28989  # 选择一个不容易冲突的端口
 
 class LocalImageHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -2447,9 +2447,11 @@ async def main(page: ft.Page):
         gallery_control_btn_container.content = gallery_popup_menu
     
     def on_gallery_btn_pan(e: ft.DragUpdateEvent):
-        safe_w = page.width if page.width else 360
-        safe_h = page.height if page.height else 640
+        # 1. 基础宽高获取 (强制转 float)
+        safe_w = float(page.width) if page.width else 360.0
+        safe_h = float(page.height) if page.height else 640.0
 
+        # 2. 计算左侧边界
         sidebar_w = 0
         if is_wide_mode:
              sidebar_w = 300 
@@ -2459,17 +2461,38 @@ async def main(page: ft.Page):
         min_left = sidebar_w + 10 
         max_left = safe_w - 60    
 
-        if gallery_control_gesture.left is None:
-            current_left = max_left - 20 
-            gallery_control_gesture.right = None 
+        # ==========================================
+        #      【核心修复】更强壮的类型转换逻辑
+        # ==========================================
+        
+        # --- 处理 Left (横向) ---
+        raw_left = gallery_control_gesture.left
+        # 如果是 None 或者 空字符串，说明还没拖动过，还在默认位置(右侧)
+        if raw_left is None or raw_left == "":
+            current_left = float(max_left - 20) 
+            gallery_control_gesture.right = None # 开始拖动后，清除 right 定位，改为 left 定位
         else:
-            current_left = gallery_control_gesture.left
+            try:
+                current_left = float(raw_left)
+            except ValueError:
+                #以此防止万一出现的其他奇怪字符
+                current_left = float(max_left - 20)
 
-        current_bottom = gallery_control_gesture.bottom or 100
+        # --- 处理 Bottom (纵向) ---
+        raw_bottom = gallery_control_gesture.bottom
+        if raw_bottom is None or raw_bottom == "":
+            current_bottom = 100.0
+        else:
+            try:
+                current_bottom = float(raw_bottom)
+            except ValueError:
+                current_bottom = 100.0
 
+        # 3. 计算新坐标
         new_left = current_left + e.delta_x
         new_bottom = current_bottom - e.delta_y 
 
+        # 4. 边界限制
         if new_left < min_left: new_left = min_left
         if new_left > max_left: new_left = max_left
 
@@ -2479,6 +2502,7 @@ async def main(page: ft.Page):
         if new_bottom < min_bottom: new_bottom = min_bottom
         if new_bottom > max_bottom: new_bottom = max_bottom
 
+        # 5. 更新位置
         gallery_control_gesture.left = new_left
         gallery_control_gesture.bottom = new_bottom
         gallery_control_gesture.update()
