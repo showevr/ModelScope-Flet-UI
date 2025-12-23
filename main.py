@@ -2583,7 +2583,7 @@ async def main(page: ft.Page):
             toggle_panel_btn.visible = False
             bottom_nav.visible = True 
 
-            custom_appbar.height = 25 
+            custom_appbar.height = 1 
             
             page1_container.visible = (t2i_page_index == 0)
             page1_container.expand = True 
@@ -2644,16 +2644,14 @@ async def main(page: ft.Page):
     page.on_resize = on_resize
 
     custom_appbar = ft.Container(
-    height=35, 
-    # 新增下面这行 padding：顶部 25 (避开刘海), 左右 10 (美观)
-    padding=ft.padding.only(top=25, left=10, right=10), 
-    content=ft.Row([
-        top_menu_btn,
-        toggle_panel_btn,
-        ft.Container(expand=True),
-        view_switch_btn 
-    ], alignment="start")
-)
+        height=50, padding=ft.padding.only(left=10, right=10),
+        content=ft.Row([
+            top_menu_btn,
+            toggle_panel_btn,
+            ft.Container(expand=True),
+            view_switch_btn 
+        ], alignment="start")
+    )
 
     # ==========================================
     #      修改点：使用 SafeArea 包裹主内容
@@ -2670,8 +2668,8 @@ async def main(page: ft.Page):
                 ft.Container(content=dots_row, height=0 if not is_wide_mode else 35, alignment=ft.alignment.center),
                 bottom_nav 
             ], spacing=0),
-            bottom=True, 
-            top=False    
+            bottom=True, # 自动避开底部横条
+            top=True     # 自动避开顶部刘海/状态栏
         )
     )
     
