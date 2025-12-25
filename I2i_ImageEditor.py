@@ -500,7 +500,8 @@ class I2I_View:
             self.uploaded_files.pop(idx)
             self._update_upload_area()
 
-    def _on_upload_file_picked(self, e: ft.FilePickerResultEvent):
+    # 🟢 修正点：移除了类型提示 ft.FilePickerResultEvent
+    def _on_upload_file_picked(self, e):
         if e.files:
             try:
                 is_multi = self.model_dropdown.value in self.MODELS_REQUIRING_LIST_INPUT
@@ -512,7 +513,8 @@ class I2I_View:
             except Exception as err: print(f"File error: {err}")
             self._update_upload_area()
 
-    def _on_file_drop(self, e: ft.FilePickerResultEvent):
+    # 🟢 修正点：移除了类型提示 ft.FilePickerResultEvent
+    def _on_file_drop(self, e):
         # 简单的文件拖拽处理
         if e.files:
             # 默认作为图片上传
