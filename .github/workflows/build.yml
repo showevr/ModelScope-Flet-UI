@@ -44,7 +44,7 @@ jobs:
           flet --version
       - name: Build APK
         run: |
-          flet build apk . --org "com.motaai" --project "motaai" --product "MotaAI" --splash-color "#ffffff" --verbose
+          flet build apk . --org "com.motaaii2i" --project "motaaii2i" --product "MotaI2I" --splash-color "#ffffff" --verbose
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
