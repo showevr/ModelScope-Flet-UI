@@ -159,9 +159,6 @@ def get_opacity_color(opacity, hex_color):
             return f"#{alpha_hex}{hex_color.lstrip('#')}"
     return hex_color
 
-# ==========================================
-#      元数据处理函数 (PNG Info)
-# ==========================================
 def add_metadata_to_png(image_bytes, metadata):
     try:
         png_signature = b'\x89PNG\r\n\x1a\n'
