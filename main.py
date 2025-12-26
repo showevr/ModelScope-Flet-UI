@@ -1,460 +1,2639 @@
 import flet as ft
+import requests
+import json
 import asyncio
-import utils
-from components import ImageViewer
-
-# 引入功能模块
-import T2i_Text2Image as T2I_Module
-import I2i_ImageEditor as I2I_Module
-import History_Module # 新增：引入历史模块
+import os
 import time
+import random
+import hashlib
+import struct
+import zlib
+import io
+import http.server
+import socketserver
+import threading
+import uuid
+
+# ==========================================
+#      【安全导入层】防止手机端崩溃
+# ==========================================
+try:
+    from PIL import ImageGrab
+    HAS_PIL_GRAB = True
+except ImportError:
+    HAS_PIL_GRAB = False
+except OSError:
+    HAS_PIL_GRAB = False
+
+# ==========================================
+#      【核心兼容层】自动适配 Flet 版本
+# ==========================================
+try:
+    MyAnimation = ft.Animation
+    MyOffset = ft.Offset
+    MyScale = ft.Scale
+except AttributeError:
+    try:
+        MyAnimation = ft.animation.Animation
+        MyOffset = ft.transform.Offset
+        MyScale = ft.transform.Scale
+    except:
+        MyAnimation = None
+        MyOffset = None
+        MyScale = None
+
+# ==========================================
+#      【新增】本地微型图片服务器 (解决0KB问题)
+# ==========================================
+LOCAL_IMAGE_CACHE = {}
+LOCAL_SERVER_PORT = 28990  # 选择一个不容易冲突的端口
+
+class LocalImageHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.startswith("/image/"):
+            try:
+                token = self.path.split('/')[-1].split('.')[0]
+                if token in LOCAL_IMAGE_CACHE:
+                    image_data = LOCAL_IMAGE_CACHE[token]
+                    self.send_response(200)
+                    self.send_header("Content-type", "image/png")
+                    self.send_header("Content-Length", str(len(image_data)))
+                    self.send_header("Content-Disposition", f'attachment; filename="AI_{token[:8]}.png"')
+                    self.end_headers()
+                    self.wfile.write(image_data)
+                else:
+                    self.send_error(404, "Image not found or expired")
+            except Exception as e:
+                pass
+        else:
+            self.send_error(404, "Not Found")
+
+    def log_message(self, format, *args):
+        pass
+
+def start_local_server():
+    try:
+        socketserver.TCPServer.allow_reuse_address = True
+        with socketserver.TCPServer(("127.0.0.1", LOCAL_SERVER_PORT), LocalImageHandler) as httpd:
+            print(f"Local Image Server running at port {LOCAL_SERVER_PORT}")
+            httpd.serve_forever()
+    except Exception as e:
+        print(f"Failed to start local server: {e}")
+
+threading.Thread(target=start_local_server, daemon=True).start()
+
+# ==========================================
+#      【全局变量与配置】
+# ==========================================
+BASE_URL = 'https://api-inference.modelscope.cn/'
+BAIDU_TRANSLATE_URL = 'https://fanyi-api.baidu.com/api/trans/vip/translate'
+I2I_FOLDER = "I2I_Edits"
+
+if not os.path.exists(I2I_FOLDER):
+    try: os.makedirs(I2I_FOLDER)
+    except: pass
+
+# ⭐️ 支持多图上传的模型列表
+MODELS_REQUIRING_LIST_INPUT = [
+    'Qwen/Qwen-Image-Edit-2509',
+    'black-forest-labs/FLUX.2-dev',
+]
+
+downloaded_urls = set()
+
+# ⭐️ 智能上传缓存：{ file_path: uploaded_url }
+file_upload_cache = {}
+
+MORANDI_COLORS = {    "Red": "#C85C56", "Orange": "#D98656", "Gold": "#D0A467", "Green": "#709D78",
+    "Teal": "#5C969C", "Blue": "#5D7EA8", "Purple": "#8C73A6"
+}
+
+STATUS_TRANSLATIONS = {
+    "PENDING": "排队中",
+    "RUNNING": "生成中",
+    "PROCESSING": "处理中",
+    "SUCCEED": "成功",
+    "FAILED": "失败",
+    "CANCELED": "已取消",
+    "UNKNOWN": "未知"
+}
+
+BG_WARM = "#F5F0EB"
+BG_LIGHT = "#FFFFFF"
+BG_DARK = "#1C1C1E"
+BG_DARK_DIALOG = "#2C2C2E"
+
+INPUT_HEIGHT = 40 
+CUSTOM_BTN_WIDTH = 68
+SEARCH_WIDTH = 70 
+
+DEFAULT_MODEL_OPTIONS = [
+    {"key": "Qwen/Qwen-Image-Edit-2509", "text": "Qwen-Image-Edit-2509"},
+    {"key": "black-forest-labs/FLUX.2-dev", "text": "FLUX.2-dev"},
+    {"key": "Qwen/Qwen-Image-Edit", "text": "Qwen/Qwen-Image-Edit (默认)"},
+    {"key": "MusePublic/FLUX.1-Kontext-Dev", "text": "FLUX.1-Kontext-Dev"},
+    {"key": "google/gemini-2.0-flash-exp", "text": "Gemini 2.0 Flash (Google)"},
+]
+
+SIZE_OPTIONS = [
+    {"key": "AutoSize", "text": "AutoSize (自动检测)"},
+    {"key": "928x1664", "text": "928x1664 (竖屏)"},
+    {"key": "1104x1472", "text": "1104x1472 (竖屏)"},
+    {"key": "1328x1328", "text": "1328x1328 (方形)"},
+    {"key": "1472x1104", "text": "1472x1104 (横屏)"},
+    {"key": "1664x928", "text": "1664x928 (横屏)"},
+    {"key": "2048x2048", "text": "2048x2048 (方形)"},
+]
+# ==========================================
+#      辅助工具函数
+# ==========================================
+def get_opacity_color(opacity, hex_color):
+    if not hex_color: return None
+    if hex_color == "black": hex_color = "#000000"
+    if hex_color == "white": hex_color = "#FFFFFF"
+    if hex_color == "transparent": return "transparent"
+    if hex_color.startswith("#"):
+        if len(hex_color) == 7:
+            alpha = int(opacity * 255)
+            alpha_hex = f"{alpha:02x}"
+            return f"#{alpha_hex}{hex_color.lstrip('#')}"
+    return hex_color
+
+# ==========================================
+#      元数据处理函数 (PNG Info)
+# ==========================================
+def add_metadata_to_png(image_bytes, metadata):
+    try:
+        png_signature = b'\x89PNG\r\n\x1a\n'
+        if not image_bytes.startswith(png_signature):
+            return image_bytes
+
+        metadata_payload = {
+            "source": "ZhaishengyuanAI",
+            "data": metadata
+        }
+        metadata_json = json.dumps(metadata_payload, ensure_ascii=False)
+        keyword = "zsyAI"
+        text_data = f"{keyword}\x00{metadata_json}"
+        chunk_type = b'tEXt'
+        chunk_data = text_data.encode('utf-8')
+        chunk_length = struct.pack('>I', len(chunk_data))
+        chunk_crc = struct.pack('>I', zlib.crc32(chunk_type + chunk_data) & 0xffffffff)
+        
+        iend_pos = image_bytes.rfind(b'IEND')
+        if iend_pos == -1:
+            return image_bytes
+
+        new_image_data = (
+            image_bytes[:iend_pos-4] + 
+            chunk_length +
+            chunk_type +
+            chunk_data +
+            chunk_crc +
+            image_bytes[iend_pos-4:] 
+        )
+        return new_image_data
+    except Exception as e:
+        print(f"Error adding metadata: {e}")
+        return image_bytes
+
+def extract_metadata_from_png(image_bytes):
+    try:
+        offset = 8 
+        while offset < len(image_bytes):
+            if offset + 8 > len(image_bytes): break
+            chunk_length = struct.unpack('>I', image_bytes[offset:offset+4])[0]
+            chunk_type = image_bytes[offset+4:offset+8]
+            
+            if offset + 12 + chunk_length > len(image_bytes): break
+            
+            chunk_data_start = offset + 8
+            chunk_data_end = chunk_data_start + chunk_length
+            chunk_data = image_bytes[chunk_data_start:chunk_data_end]
+            
+            if chunk_type in [b'tEXt', b'zTXt']:
+                try:
+                    decoded_text = ""
+                    if chunk_type == b'zTXt':
+                        parts = chunk_data.split(b'\x00', 1)
+                        if len(parts) >= 2:
+                            if len(parts[1]) > 1:
+                                compressed_data = parts[1][1:]
+                                decoded_text = zlib.decompress(compressed_data).decode('utf-8')
+                    else:
+                        decoded_text = chunk_data.decode('utf-8', errors='ignore')
+                    
+                    if '\x00' in decoded_text:
+                        keyword, metadata_str = decoded_text.split('\x00', 1)
+                        if keyword in ["ZhaishengyuanAI", "zsyAI"]:
+                            try:
+                                metadata = json.loads(metadata_str)
+                                if isinstance(metadata, dict) and 'data' in metadata:
+                                    return metadata['data']
+                                else:
+                                    return metadata
+                            except json.JSONDecodeError:
+                                continue
+                except Exception:
+                    continue
+            
+            if chunk_type == b'IEND':
+                break
+            offset += 12 + chunk_length
+        return None
+    except Exception as e:
+        print(f"Error extracting metadata: {e}")
+        return None
+
+# ==========================================
+#      【新增】图片编辑专用工具函数
+# ==========================================
+
+def get_image_size(file_path):
+    """简单的获取图片宽高函数，用于AutoSize逻辑"""
+    try:
+        with open(file_path, 'rb') as f:
+            head = f.read(24)
+            if len(head) != 24: return None
+            if head.startswith(b'\x89PNG\r\n\x1a\n'):
+                w, h = struct.unpack('>II', head[16:24])
+                return w, h
+            elif head.startswith(b'\xff\xd8'):
+                f.seek(0)
+                ftype = 0
+                while True:
+                    byte = f.read(1)
+                    if not byte: break
+                    if byte == b'\xff':
+                        byte = f.read(1)
+                        if not byte: break
+                        if byte[0] >= 0xc0 and byte[0] <= 0xcf and byte[0] != 0xc4 and byte[0] != 0xc8 and byte[0] != 0xcc:
+                            f.read(3)
+                            h, w = struct.unpack('>HH', f.read(4))
+                            return w, h
+                        else:
+                            f.read(int.from_bytes(f.read(2), 'big') - 2)
+    except:
+        return None
+    return None
+
+async def upload_image_to_host(file_path):
+    # ⭐️ 智能复用：先检查缓存
+    if file_path in file_upload_cache:
+        print(f"Reuse cached URL for: {file_path}")
+        return file_upload_cache[file_path]
+
+    try:
+        filename = os.path.basename(file_path)
+        with open(file_path, 'rb') as f:
+            files = {'files[]': (filename, f, 'image/png')}
+            res = await asyncio.to_thread(requests.post, "https://uguu.se/upload", files=files, timeout=60)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('success'):
+                url = data['files'][0]['url'].replace('\\', '')
+                # ⭐️ 存入缓存
+                file_upload_cache[file_path] = url
+                return url
+        return None
+    except Exception as e:
+        print(f"Upload failed: {e}")
+        return None
+
+# ==========================================
+#             Main Application
+# ==========================================
 
 async def main(page: ft.Page):
-    # ================= 1. 基础窗口设置 =================
+    # ================= 1. 设置窗口属性 =================
     page.window.min_width = 380
     page.window.min_height = 600
     page.window.resizable = True   
-    page.title = "魔塔AI大全"
+    page.title = "魔塔AI大全 - 图片编辑"
     page.padding = 0
+    
+    # ⭐️ 初始化上传列表
+    uploaded_files = []
     page.spacing = 0
-    page.appbar = None
-    
-    # 启动本地图片服务器
-    utils.start_local_server()
-    
-    # 【新增】启动时初始化缓存系统 (清理旧缓存)
-    utils.init_cache_system()
+    page.appbar = None 
+    try: page.expand = True 
+    except: pass
 
-    # ================= 2. 读取全局配置 =================
-    config = await utils.load_global_config(page)
-    
-    # 全局变量初始化
-    current_api_keys = config["api_keys"]
-    current_baidu_config = config["baidu_config"]
-    current_theme_color_name = config["theme_color_name"]
-    current_theme_mode = config["theme_mode"]
-    current_power_config = config["power_mode_config"] 
-    
-    current_primary_color = utils.MORANDI_COLORS.get(current_theme_color_name, "#D0A467")
-    current_text_color = utils.get_text_color(current_theme_mode)
+    # ================= 2. 读取本地存储 =================
+    try:
+        stored_api_keys_str = await page.client_storage.get_async("api_keys") or ""
+        stored_baidu_config = await page.client_storage.get_async("baidu_config") or ""
+        stored_color_name = await page.client_storage.get_async("theme_color") or "Gold"
+        stored_mode = await page.client_storage.get_async("theme_mode") or "dark"
+        stored_custom_models = await page.client_storage.get_async("custom_models") or ""
+    except Exception as e:
+        print(f"Error reading storage: {e}")
+        stored_api_keys_str, stored_baidu_config = "", ""
+        stored_color_name, stored_mode = "Gold", "dark"
+        stored_custom_models = ""
 
-    # ================= 3. 全局状态定义 =================
+    current_api_keys = [k.strip() for k in stored_api_keys_str.split('\n') if k.strip()]
+    current_primary_color = MORANDI_COLORS.get(stored_color_name, "#D0A467")
     
-    # 定义应用清单 (用于双击切换逻辑)
-    # 【修改】加入历史记录
-    APP_MAP = {
-        "t2i": {"name": "文生图", "icon": "palette"},
-        "i2i": {"name": "图片编辑", "icon": "auto_fix_high"},
-        "history": {"name": "历史记录", "icon": "history"}
-    }
-
-    current_app_key = "t2i" 
-    t2i_page_index = 0      
+    baidu_lines = stored_baidu_config.split('\n')
+    current_baidu_appid = baidu_lines[0].strip() if len(baidu_lines) > 0 else ""
+    current_baidu_key = baidu_lines[1].strip() if len(baidu_lines) > 1 else ""
+    
+    sidebar_offset = MyOffset(-1, 0) if MyOffset else None
+    t2i_page_index = 0
     is_wide_mode = False
     left_panel_visible = True
-    is_sidebar_open = False 
-    
-    # ------------------ 功能切换浮层 ------------------
-    func_menu_content = ft.Column(spacing=2)
-    
-    anim_style = utils.MyAnimation(200, "easeOut") if utils.MyAnimation else None
-    scale_style = utils.MyScale(0.9) if utils.MyScale else None
 
-    func_menu_card = ft.Container(
-        content=func_menu_content,
-        bgcolor=utils.get_dropdown_bgcolor(current_theme_mode),
-        border_radius=0, 
-        border=ft.border.only(bottom=ft.BorderSide(1, ft.Colors.with_opacity(0.1, "on_surface"))), 
-        padding=5,
-        shadow=ft.BoxShadow(blur_radius=20, color=ft.Colors.with_opacity(0.3, "black")),
-        visible=False, 
-        bottom=56,       
-        left=0, right=0, 
-        alignment=ft.alignment.center,
-        animate_opacity=200,
-        animate_scale=anim_style,
-        scale=scale_style,
-        opacity=0
-    )
+    # ================= 4. 核心功能函数 =================
 
-    def open_func_menu(e):
-        """双击底部导航中间按钮触发：显示切换菜单"""
-        func_menu_card.width = None 
-        func_menu_card.left = 0
-        func_menu_card.right = 0
-        
-        items = []
-        for key, info in APP_MAP.items():
-            if key == current_app_key: continue 
-            
-            item = ft.Container(
-                content=ft.Row([
-                    ft.Icon(info['icon'], size=20, color=current_primary_color), 
-                    ft.Text(info['name'], size=14, color=current_text_color)
-                ], alignment="center", spacing=10),
-                padding=ft.padding.symmetric(vertical=12, horizontal=10),
-                border_radius=8,
-                ink=True,
-                on_click=lambda e, k=key: switch_app(k)
-            )
-            items.append(item)
+    async def save_config(key, value):
+        try: await page.client_storage.set_async(key, value)
+        except: pass
 
-        if not items:
-            items.append(ft.Container(content=ft.Text("无其他功能", size=12, color="grey"), padding=10, alignment=ft.alignment.center))
-
-        func_menu_content.controls = items
-        
-        func_menu_card.visible = True
-        func_menu_card.opacity = 1
-        func_menu_card.scale = 1.0 
-        func_menu_card.update()
-
-    def close_func_menu():
-        """关闭功能菜单"""
-        if func_menu_card.visible:
-            func_menu_card.opacity = 0
-            func_menu_card.scale = 0.9
-            func_menu_card.update()
-            func_menu_card.visible = False
+    def safe_open_dialog(dlg):
+        try: page.open(dlg)
+        except: 
+            page.dialog = dlg
+            dlg.open = True
             page.update()
 
-    # -------------------------------------------------------
+    def safe_close_dialog(dlg):
+        try: page.close(dlg)
+        except: 
+            dlg.open = False
+            page.update()
 
-    # 前置声明 switch_app
-    def switch_app(key):
-        nonlocal current_app_key, t2i_page_index
-        
-        close_func_menu()
-        current_app_key = key
-        toggle_sidebar(False)
-        
-        is_t2i = (key == 't2i')
-        is_i2i = (key == 'i2i')
-        is_history = (key == 'history')
-        
-        # 1. 核心区域显隐切换
-        # 如果是 T2I/I2I，显示 Slider；如果是 History，显示 History Container
-        if is_history:
-            t2i_slider_container.visible = False
-            history_container.visible = True
-            # History 模式下不需要底部生成按钮栏
-            fixed_bottom_action_bar.visible = False
-            # 也不需要分页点
-            dots_row.visible = False
-            
-            # 刷新历史记录
-            history_app.refresh_history()
-        else:
-            t2i_slider_container.visible = True
-            history_container.visible = False
-            fixed_bottom_action_bar.visible = True
-            
-            # 恢复 Dots (根据宽屏模式)
-            dots_row.visible = not is_wide_mode
+    def get_dropdown_fill_color():
+        if stored_mode == "dark": return "#3C3C3E"
+        elif stored_mode == "warm": return "#FFFBF6"
+        else: return "#FFFFFF"
 
-            # T2I / I2I 内部切换
-            t2i_input_wrapper.visible = is_t2i
-            i2i_input_wrapper.visible = is_i2i
-            
-            t2i_btn_wrapper.visible = is_t2i
-            i2i_btn_wrapper.visible = is_i2i
-            
-            t2i_result_wrapper.visible = is_t2i
-            i2i_result_wrapper.visible = is_i2i
-            
-            # 键盘事件绑定
-            module = t2i_app if is_t2i else i2i_app
-            page.on_keyboard_event = module.handle_keyboard_event
-            
-            # 更新模块布局
-            module.update_theme(current_primary_color, current_theme_mode)
-            module.on_resize(is_wide_mode, page.width, page.height)
-            
-            if not is_wide_mode:
-                t2i_page_index = 0
-                switch_t2i_page(0)
+    def get_dropdown_bgcolor():
+        if stored_mode == "dark": return "#3C3C3E"
+        elif stored_mode == "warm": return "#FFFBF6"
+        else: return "#FFFFFF"
+        
+    def get_border_color():
+        if stored_mode == "dark": return "#525252"
+        return "#d9d9d9"
+        
+    def get_viewer_bgcolor_dynamic():
+        if stored_mode == "dark": return BG_DARK
+        elif stored_mode == "warm": return BG_WARM
+        else: return BG_LIGHT
 
-        # 2. 更新底部导航图标和文字
-        info = APP_MAP.get(key, {"name": "未知", "icon": "help"})
-        nav_btn_func_icon.name = info["icon"]
-        nav_btn_func_text.value = info["name"]
-        
-        # 3. 更新侧边栏选中状态
-        sidebar_items_container.controls = [
-            build_sidebar_item("palette", "文生图", "t2i", is_t2i),
-            build_sidebar_item("auto_fix_high", "图片编辑", "i2i", is_i2i),
-            build_sidebar_item("history", "历史记录", "history", is_history)
-        ]
-        
+    def copy_text(text):
+        page.set_clipboard(text)
+        page.snack_bar = ft.SnackBar(ft.Text("已复制到剪贴板"), open=True)
         page.update()
 
-    # ================= 核心：图片流转逻辑 =================
-    
-    async def handle_transfer_to_edit(image_src):
-        if not image_src: return
-        page.snack_bar = ft.SnackBar(ft.Text("正在准备图片数据..."), open=True)
-        page.update()
-
-        final_path = image_src
-        # 如果是网络图片，先下载；如果是本地缓存(History)，直接用
-        if image_src.startswith("http"):
-            local_path = await utils.save_temp_image_from_url(image_src)
-            if local_path:
-                final_path = local_path
+    def translate_text(text, to_lang="en"):
+        nonlocal current_baidu_appid, current_baidu_key
+        if not current_baidu_appid or not current_baidu_key:
+            page.snack_bar = ft.SnackBar(ft.Text("请先在设置中配置百度翻译 Key"), open=True)
+            page.update()
+            return None
+        try:
+            salt = str(random.randint(32768, 65536))
+            sign_str = current_baidu_appid + text + salt + current_baidu_key
+            sign = hashlib.md5(sign_str.encode()).hexdigest()
+            res = requests.post(BAIDU_TRANSLATE_URL, data={
+                'q': text, 'from': 'auto', 'to': to_lang,
+                'appid': current_baidu_appid, 'salt': salt, 'sign': sign
+            }, timeout=5)
+            data = res.json()
+            if 'trans_result' in data: return data['trans_result'][0]['dst']
             else:
-                page.snack_bar = ft.SnackBar(ft.Text("图片下载失败，无法发送到编辑"), open=True)
+                page.snack_bar = ft.SnackBar(ft.Text(f"翻译错误: {data.get('error_msg')}"), open=True)
                 page.update()
-                return
+                return None
+        except Exception as e:
+            page.snack_bar = ft.SnackBar(ft.Text(f"翻译请求失败: {str(e)}"), open=True)
+            page.update()
+            return None
 
-        i2i_app.set_input_image(final_path)
-        switch_app('i2i')
-        page.snack_bar = ft.SnackBar(ft.Text("✅ 图片已发送到编辑"), open=True)
-        page.update()
-        
-    def update_gallery_btn_visibility():
-        # 历史模式下，不需要显示结果切换按钮
-        if current_app_key == 'history':
-            gallery_control_gesture.visible = False
+    # --- 【新功能】直接保存到本地 T2I 文件夹 (横屏专用) ---
+    async def save_image_to_local_folder(url, metadata=None):
+        if not url: return False
+        try:
+            res = await asyncio.to_thread(requests.get, url, timeout=30)
+            if res.status_code == 200:
+                image_bytes = res.content
+                if metadata:
+                    image_bytes = add_metadata_to_png(image_bytes, metadata)
+                
+                # 生成文件名
+                timestamp = int(time.time())
+                filename = f"img_{timestamp}_{random.randint(100,999)}.png"
+                save_path = os.path.join(I2I_FOLDER, filename)
+                
+                # 写入文件
+                with open(save_path, "wb") as f:
+                    f.write(image_bytes)
+                
+                page.snack_bar = ft.SnackBar(ft.Text(f"✅ 图片已保存至: {save_path}"), open=True)
+                page.update()
+                return True
+            else:
+                page.snack_bar = ft.SnackBar(ft.Text("下载失败: 网络错误"), open=True)
+                page.update()
+                return False
+        except Exception as err:
+            page.snack_bar = ft.SnackBar(ft.Text(f"保存错误: {str(err)}"), open=True)
+            page.update()
+            return False
+
+    # --- 【新功能】通过本地服务器中转下载 (竖屏专用) ---
+    async def download_via_local_server(url, metadata=None):
+        if not url: return False
+        try:
+            page.snack_bar = ft.SnackBar(ft.Text("正在调用浏览器下载..."), open=True)
+            page.update()
+            
+            res = await asyncio.to_thread(requests.get, url, timeout=30)
+            if res.status_code != 200:
+                raise Exception("图片下载失败")
+                
+            image_bytes = res.content
+            if metadata:
+                image_bytes = add_metadata_to_png(image_bytes, metadata)
+            
+            token = str(uuid.uuid4())
+            LOCAL_IMAGE_CACHE[token] = image_bytes
+            local_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}/image/{token}.png"
+            
+            page.launch_url(local_url)
+            return True
+            
+        except Exception as err:
+            page.snack_bar = ft.SnackBar(ft.Text(f"处理失败: {str(err)}"), open=True)
+            page.update()
+            return False
+
+    # --- 【通用】设置按钮为已下载状态 ---
+    def mark_btn_downloaded(btn):
+        if btn:
+            btn.icon = "check_circle"
+            btn.icon_color = current_primary_color
+            btn.tooltip = "已下载/已保存"
+            btn.disabled = True
+            # 安全更新
+            try: btn.update()
+            except: pass
+
+    # ================= UI 引用与组件定义 =================
+    
+    sidebar_icon_ref = ft.Icon("smart_toy", size=40, color="grey")
+    sidebar_title_ref = ft.Text("魔塔AI大全", size=18, weight="bold", color="grey")
+    sidebar_subtitle_ref = ft.Text("By_showevr", size=12, color="grey")
+    
+    nav_highlight_ref = ft.Container(width=4, height=20, border_radius=2)
+    nav_icon_ref = ft.Icon("palette", color="grey", size=20) 
+    nav_text_ref = ft.Text("文生图", size=16, weight="bold", color="grey")
+    
+    sidebar_div1 = ft.Divider(height=10, thickness=0.5, color="transparent")
+    sidebar_div2 = ft.Divider(height=10, thickness=0.5, color="transparent")
+
+    nav_container_ref = ft.Container(
+        content=ft.Row([
+            ft.Row([nav_icon_ref, ft.Container(width=10), nav_text_ref]), 
+            ft.Container(expand=True), 
+            nav_highlight_ref
+        ], alignment="spaceBetween"),
+        padding=ft.padding.symmetric(horizontal=20, vertical=12), 
+        border_radius=30, 
+        animate=MyAnimation(200, "easeOut") if MyAnimation else None
+    )
+    
+    theme_dialog = ft.AlertDialog(title=ft.Text("显示与主题", weight="bold", size=14), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
+    settings_dialog = ft.AlertDialog(title=ft.Text("全局设置", size=14), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
+
+   # ==========================================
+    #      【重构版】原生级图片查看器 (原生手势+无缝切换版)
+    #      修复：鼠标滚轮缩放、双指缩放手感、竖屏放大被裁剪问题
+    # ==========================================
+    
+    # 状态变量
+    is_viewer_info_open = False 
+    viewer_zoom_level = 1.0
+    _viewer_drag_offset_x = 0.0
+
+    def close_viewer(e=None):
+        nonlocal is_viewer_info_open, viewer_zoom_level, _viewer_drag_offset_x
+        is_viewer_info_open = False 
+        viewer_overlay.visible = False
+        if not is_wide_mode and t2i_page_index == 1:
+            gallery_control_gesture.visible = True
             gallery_control_gesture.update()
-            return
 
-        is_on_result_view = (is_wide_mode or t2i_page_index == 1)
-        should_show = is_on_result_view and (not is_sidebar_open) and (not image_viewer.is_open)
-        
-        if gallery_control_gesture.visible != should_show:
-            gallery_control_gesture.visible = should_show
-            gallery_control_gesture.update()
+        try: viewer_overlay.update()
+        except: pass
+        reset_viewer_zoom(update_ui=False)
 
-    # 初始化 ImageViewer
-    image_viewer = ImageViewer(
-        page, 
-        current_primary_color, 
-        current_theme_mode, 
-        on_edit_click=handle_transfer_to_edit,
-        on_dismiss=lambda: update_gallery_btn_visibility() 
+    # --- 1. 图片组件初始化 ---
+    # 当前图片
+    inner_viewer_img = ft.Image(src="", fit=ft.ImageFit.CONTAIN, gapless_playback=True)
+    # 预加载图片 (用于滑动时显示下一张/上一张)
+    preload_viewer_img = ft.Image(src="", fit=ft.ImageFit.CONTAIN, gapless_playback=True, opacity=1)
+
+    # --- 2. 核心缩放交互层 (底层 - 负责缩放后的漫游) ---
+    
+    # 【新增】模式切换提示胶囊 (Toast)
+    zoom_hint_text = ft.Text("大图模式", color="white", size=14, weight="bold")
+    zoom_hint_container = ft.Container(
+        content=zoom_hint_text,
+        bgcolor=get_opacity_color(0.7, current_primary_color), 
+        padding=ft.padding.symmetric(horizontal=20, vertical=10),
+        border_radius=30,
+        opacity=0, 
+        animate_opacity=300, 
+        visible=False,
+        shadow=ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.3, "black"))
     )
 
-    def show_viewer_callback(src, all_images_data, current_index):
-        # 根据当前 APP Key 决定文件夹名称 (History 模式特殊处理)
-        folder = "History" if current_app_key == "history" else ("T2I" if current_app_key == "t2i" else "I2I_Edits")
-        image_viewer.show(src, all_images_data, current_index, target_folder=folder)
-        update_gallery_btn_visibility()
+    # 【新增】触发提示显示的异步任务
+    async def show_zoom_hint_task(text):
+        # 1. 设置内容和颜色 (确保颜色是最新的)
+        zoom_hint_text.value = text
+        zoom_hint_container.bgcolor = get_opacity_color(0.7, current_primary_color)
+        
+        # 2. 显示
+        zoom_hint_container.visible = True
+        zoom_hint_container.opacity = 1
+        zoom_hint_container.update()
+        
+        # 3. 停留 0.5 秒
+        await asyncio.sleep(0.5)
+        
+        # 4. 渐隐
+        zoom_hint_container.opacity = 0
+        zoom_hint_container.update()
+        
+        # 5. 等待动画结束彻底隐藏
+        await asyncio.sleep(0.3)
+        zoom_hint_container.visible = False
+        zoom_hint_container.update()
 
-    def switch_view_page_callback(target_index):
-        if not is_wide_mode:
-            switch_t2i_page(target_index)
+    # 【新增】辅助调用函数
+    def trigger_zoom_hint(text):
+        page.run_task(show_zoom_hint_task, text)
 
-    # ================= 4. 初始化功能模块 =================
+    # 【修改后的】手机端模式切换逻辑
+    is_mobile_zoom_mode = False
+
+    def toggle_mobile_zoom_mode(enable):
+        nonlocal is_mobile_zoom_mode
+        is_mobile_zoom_mode = enable
+        
+        outer_gesture_detector.visible = not enable
+        
+        if enable:
+            # ======= 进入大图模式 =======
+            interactive_viewer.scale = 1.2
+            prev_btn.visible = False
+            next_btn.visible = False
+            
+            viewer_controls_container.visible = False
+            trigger_zoom_hint("大图模式")
+        else:
+            interactive_viewer.scale = 1.0
+            if is_wide_mode:
+                prev_btn.visible = True
+                next_btn.visible = True
+            viewer_controls_container.visible = True
+            trigger_zoom_hint("退出缩放")
+        
+        try:
+            outer_gesture_detector.update()
+            interactive_viewer.update()
+            prev_btn.update()
+            next_btn.update()
+
+            viewer_controls_container.update()
+            update_viewer_layout_content()
+        except: pass
+
+    def on_inner_double_tap(e):
+        if is_wide_mode:
+            reset_viewer_zoom(True)
+        else:
+            toggle_mobile_zoom_mode(False)
+
+    inner_gesture = ft.GestureDetector(
+        # 给图片包一层 Container 并居中
+        content=ft.Container(
+            content=inner_viewer_img,
+            alignment=ft.alignment.center, 
+            expand=True 
+        ),
+        on_double_tap=on_inner_double_tap,
+        expand=True 
+    )
+
+    interactive_viewer = ft.InteractiveViewer(
+        key="iv_viewer", 
+        content=inner_gesture, 
+        min_scale=0.2, 
+        max_scale=5.0, 
+        scale_enabled=True, 
+        pan_enabled=True,      
+        expand=True,
+        boundary_margin=ft.padding.all(800)
+    )
+
+    # --- 3. 滑动容器层 ---
+    swipe_anim_container = ft.Container(
+        content=interactive_viewer,
+        offset=MyOffset(0, 0) if MyOffset else None,
+        animate_offset=MyAnimation(300, "easeOut") if MyAnimation else None,
+        expand=True,
+        on_click=lambda e: toggle_overlay_ui(e)
+    )
+
+    preload_container = ft.Container(
+        content=preload_viewer_img,
+        offset=MyOffset(1, 0) if MyOffset else None, 
+        animate_offset=MyAnimation(300, "easeOut") if MyAnimation else None,
+        alignment=ft.alignment.center,
+        expand=True,
+        visible=False 
+    )
+
+    # --- 4. 顶层手势检测 (负责翻页 + 宽屏鼠标滚轮) ---
     
-    t2i_app = T2I_Module.T2I_View(page, config, show_viewer_callback, switch_view_page_callback, transfer_callback=handle_transfer_to_edit)
-    i2i_app = I2I_Module.I2I_View(page, config, show_viewer_callback, switch_view_page_callback, transfer_callback=handle_transfer_to_edit)
-    # 【新增】初始化历史模块
-    history_app = History_Module.History_View(page, config, show_viewer_callback)
+    # 顶层双击（默认模式下触发）
+    def on_outer_double_tap(e):
+        if is_wide_mode:
+            reset_viewer_zoom(True)
+        else:
+            # 手机端：双击进入缩放模式，隐藏遮罩
+            toggle_mobile_zoom_mode(True)
 
-    # ================= 5. 构建 UI 骨架 =================
+    # 【分离优化】鼠标滚轮 - 仅宽屏/桌面模式生效
+    def on_outer_scroll(e: ft.ScrollEvent):
+        if not is_wide_mode: return # 手机端禁用滚轮逻辑，防止冲突
+        
+        # 桌面端简单逻辑：滚动即放大
+        if e.scroll_delta_y != 0:
+            if interactive_viewer.scale < 1.1:
+                 interactive_viewer.scale = 1.2
+                 outer_gesture_detector.visible = False # 桌面端保持原有逻辑
+                 try: 
+                     interactive_viewer.update()
+                     outer_gesture_detector.update()
+                 except: pass
 
-    # --- 5.1 T2I/I2I 视图堆叠 ---
-    t2i_input_wrapper = ft.Container(content=t2i_app.get_input_content(), visible=True, expand=True)
-    i2i_input_wrapper = ft.Container(content=i2i_app.get_input_content(), visible=False, expand=True)
-    page1_stack = ft.Stack([t2i_input_wrapper, i2i_input_wrapper], expand=True)
+    # 【分离优化】双指缩放更新 - 仅宽屏/桌面模式生效
+    def on_outer_scale_update(e: ft.ScaleUpdateEvent):
+        if not is_wide_mode: return # 手机端完全交给底层原生处理，此处不干扰
+        
+        current_preview_scale = max(1.0, e.scale)
+        interactive_viewer.scale = current_preview_scale
+        try: interactive_viewer.update()
+        except: pass
 
-    t2i_btn_wrapper = ft.Container(content=t2i_app.get_generate_btn(), visible=True)
-    i2i_btn_wrapper = ft.Container(content=i2i_app.get_generate_btn(), visible=False)
-    bottom_btn_stack = ft.Stack([t2i_btn_wrapper, i2i_btn_wrapper])
+    # 【分离优化】双指缩放结束 - 仅宽屏/桌面模式生效
+    def on_outer_scale_end(e: ft.ScaleEndEvent):
+        if not is_wide_mode: return
+        
+        if interactive_viewer.scale > 1.1:
+            # 桌面端：切换到底层
+            outer_gesture_detector.visible = False
+            try: outer_gesture_detector.update()
+            except: pass
+        else:
+            reset_viewer_zoom()
 
-    fixed_bottom_action_bar = ft.Container(
-        content=bottom_btn_stack,
-        padding=ft.padding.symmetric(horizontal=0, vertical=10),
+    def on_outer_pan_update(e: ft.DragUpdateEvent):
+        nonlocal _viewer_drag_offset_x
+        # 只有在未放大时才允许翻页滑动
+        if viewer_zoom_level > 1.1: return 
+
+        width = page.width if page.width and page.width > 0 else 360
+        _viewer_drag_offset_x += e.delta_x
+        
+        ratio = _viewer_drag_offset_x / width
+        
+        if MyOffset:
+            swipe_anim_container.animate_offset = None 
+            swipe_anim_container.offset = MyOffset(ratio, 0)
+        
+        if abs(_viewer_drag_offset_x) > 10: 
+            preload_container.visible = True
+            preload_container.animate_offset = None
+            
+            target_index = -1
+            preload_start_x = 0.0
+            
+            if _viewer_drag_offset_x < 0: 
+                target_index = current_viewer_index + 1
+                preload_start_x = 1.0 
+            else: 
+                target_index = current_viewer_index - 1
+                preload_start_x = -1.0
+            
+            if 0 <= target_index < len(current_viewer_grid_images):
+                preload_viewer_img.src = current_viewer_grid_images[target_index].src
+                preload_container.offset = MyOffset(preload_start_x + ratio, 0)
+            else:
+                preload_viewer_img.src = ""
+        
+        try: 
+            swipe_anim_container.update()
+            preload_container.update()
+        except: pass
+
+    async def on_outer_pan_end(e: ft.DragEndEvent):
+        nonlocal _viewer_drag_offset_x
+        if viewer_zoom_level > 1.1: return
+
+        width = page.width if page.width and page.width > 0 else 360
+        threshold = 60
+        
+        anim = MyAnimation(300, "easeOut") if MyAnimation else None
+        swipe_anim_container.animate_offset = anim
+        preload_container.animate_offset = anim
+        
+        velocity = getattr(e, "velocity_x", 0)
+        should_switch_next = (_viewer_drag_offset_x < -threshold) or (velocity < -500)
+        should_switch_prev = (_viewer_drag_offset_x > threshold) or (velocity > 500)
+
+        if should_switch_next and current_viewer_index < len(current_viewer_grid_images) - 1:
+            await navigate_viewer(1)
+        elif should_switch_prev and current_viewer_index > 0:
+            await navigate_viewer(-1)
+        else:
+            reset_drag_position()
+        
+        _viewer_drag_offset_x = 0
+
+    def reset_drag_position():
+        if MyOffset:
+            swipe_anim_container.offset = MyOffset(0, 0)
+            preload_container.offset = MyOffset(1, 0) 
+            try: 
+                swipe_anim_container.update()
+                preload_container.update()
+            except: pass
+            page.run_task(hide_preload_later)
+
+    async def hide_preload_later():
+        await asyncio.sleep(0.3)
+        preload_container.visible = False
+        try: preload_container.update()
+        except: pass
+
+    outer_gesture_detector = ft.GestureDetector(
+        content=ft.Container(bgcolor=ft.Colors.TRANSPARENT, expand=True), 
+        on_double_tap=on_outer_double_tap,
+        on_pan_update=on_outer_pan_update,
+        on_pan_end=on_outer_pan_end,
+        on_scroll=on_outer_scroll,           
+        on_scale_update=on_outer_scale_update, 
+        on_scale_end=on_outer_scale_end,     
+        expand=True,
+        visible=True 
+    )
+
+    def reset_viewer_zoom(update_ui=True):
+        nonlocal viewer_zoom_level, _viewer_drag_offset_x, is_mobile_zoom_mode
+        viewer_zoom_level = 1.0
+        _viewer_drag_offset_x = 0.0
+        is_mobile_zoom_mode = False # 重置手机缩放状态
+        
+        interactive_viewer.scale = 1.0
+        outer_gesture_detector.visible = True 
+        preload_container.visible = False
+        
+        if MyOffset:
+            swipe_anim_container.offset = MyOffset(0, 0)
+            swipe_anim_container.animate_offset = MyAnimation(300, "easeOut") if MyAnimation else None
+            preload_container.offset = MyOffset(1, 0)
+        
+        if update_ui:
+            try:
+                interactive_viewer.update()
+                outer_gesture_detector.update()
+                swipe_anim_container.update()
+                preload_container.update()
+            except: pass
+
+    current_viewer_grid_images = [] 
+    current_viewer_index = 0
+    is_animating = False 
+    
+    # 背景容器 (Stack 布局)
+    viewer_image_stack_content = ft.Stack([
+        preload_container,       
+        swipe_anim_container,    
+        outer_gesture_detector,
+        # 【最终修复】直接将提示胶囊放入 Stack，利用 Stack 的 alignment 属性居中
+        # 这样提示胶囊只占据自身大小的空间，不会遮挡周围的触摸区域
+        zoom_hint_container  
+    ], expand=True, alignment=ft.alignment.center) # <--- 关键：设置 Stack 内容居中对齐
+
+    viewer_background_container = ft.Container(
+        expand=True, alignment=ft.alignment.center, content=viewer_image_stack_content
+    )
+
+    # --- UI 显隐逻辑 ---
+    def toggle_overlay_ui(e):
+        current_vis = viewer_controls_container.visible
+        new_vis = not current_vis
+        
+        viewer_controls_container.visible = new_vis
+        prev_btn.visible = new_vis and is_wide_mode 
+        next_btn.visible = new_vis and is_wide_mode
+        
+        # 强制刷新布局
+        update_viewer_layout_content()
+
+
+    # --- 信息面板组件 ---
+    viewer_info_prompt = ft.Text("无", selectable=True, size=13, color=current_primary_color)
+    viewer_info_neg = ft.Text("无", selectable=True, size=13, color=current_primary_color)
+    viewer_title_prompt = ft.Text("Prompt", size=11, weight="bold", color=current_primary_color)
+    viewer_title_neg = ft.Text("Negative", size=11, weight="bold", color=current_primary_color)
+
+    viewer_copy_prompt_btn = ft.IconButton("content_copy", icon_size=14, icon_color=current_primary_color, on_click=lambda e: copy_text(viewer_info_prompt.value))
+    viewer_copy_neg_btn = ft.IconButton("content_copy", icon_size=14, icon_color=current_primary_color, on_click=lambda e: copy_text(viewer_info_neg.value))
+
+    viewer_text_col = ft.Column([
+        ft.Row([viewer_title_prompt, viewer_copy_prompt_btn], alignment="spaceBetween"),
+        ft.Container(content=viewer_info_prompt, padding=ft.padding.only(bottom=5)), 
+        ft.Divider(height=10, color="white24"),
+        ft.Row([viewer_title_neg, viewer_copy_neg_btn], alignment="spaceBetween"),
+        ft.Container(content=viewer_info_neg),
+    ], scroll=ft.ScrollMode.ALWAYS, expand=True)
+
+    # 【关键修改】Info容器现在是Overlay的一部分，不再影响主布局结构
+    viewer_info_container = ft.Container(
+        content=viewer_text_col,
+        padding=15, 
+        bgcolor=get_dropdown_bgcolor(),
+        border_radius=ft.border_radius.only(top_left=15, top_right=15),
+        shadow=ft.BoxShadow(blur_radius=15, color=ft.Colors.with_opacity(0.3, "black")),
+        expand=True,
+        visible=False, # 默认隐藏
+        animate_opacity=200,
+        opacity=0
+    )
+    
+    # 翻页函数
+    # 【重写-最终修复版】异步丝滑切换函数 (解决动画不触发问题)
+    async def navigate_viewer(delta):
+        nonlocal current_viewer_index, is_animating, _viewer_drag_offset_x
+        if is_animating: return # 动画中禁止操作
+        if not current_viewer_grid_images: return
+        
+        new_index = current_viewer_index + delta
+        
+        # 边界检查
+        if new_index < 0:
+            reset_drag_position()
+            page.snack_bar = ft.SnackBar(ft.Text("已经是第一张了"), open=True)
+            page.update()
+            return
+        if new_index >= len(current_viewer_grid_images):
+            reset_drag_position()
+            page.snack_bar = ft.SnackBar(ft.Text("已经是最后一张了"), open=True)
+            page.update()
+            return
+
+        # 锁定状态
+        is_animating = True
+        target_img_obj = current_viewer_grid_images[new_index]
+        
+        # 1. 准备预加载层
+        preload_viewer_img.src = target_img_obj.src
+        preload_container.visible = True
+        
+        # 计算方向
+        # delta > 0 (下一张): 预加载从右(1)进，主图往左(-1)出
+        # delta < 0 (上一张): 预加载从左(-1)进，主图往右(1)出
+        start_preload_x = 1.0 if delta > 0 else -1.0
+        end_main_x = -1.0 if delta > 0 else 1.0
+        
+        # 如果是点击触发（当前未拖动，offset为0），需要先把预加载层瞬移到位
+        if swipe_anim_container.offset.x == 0:
+            preload_container.animate_offset = None
+            preload_container.offset = MyOffset(start_preload_x, 0)
+            preload_container.update()
+        
+        # ==================================================
+        # 【核心修复】分步激活：先开启动画，刷新，再移动
+        # ==================================================
+        
+        # 步骤 A: 告诉引擎 "开启 300ms 动画"
+        anim_setting = MyAnimation(300, "easeOut") if MyAnimation else None
+        swipe_anim_container.animate_offset = anim_setting
+        preload_container.animate_offset = anim_setting
+        
+        # 强制刷新状态，让引擎消化这个设置
+        swipe_anim_container.update()
+        preload_container.update()
+        
+        # 关键停顿！让动画属性生效（给一点点时间让前端渲染层感知状态变化）
+        await asyncio.sleep(0.05)
+        
+        # 步骤 B: 此时引擎已准备好，现在设置新坐标，它就会平滑滑过去了
+        swipe_anim_container.offset = MyOffset(end_main_x, 0)
+        preload_container.offset = MyOffset(0, 0)
+        
+        try:
+            swipe_anim_container.update()
+            preload_container.update()
+        except: pass
+        
+        # ==================================================
+        
+        # 4. 等待动画播放完毕 (稍微多给一点时间，防止剪切)
+        await asyncio.sleep(0.35)
+        
+        # 5. 偷天换日：数据归位
+        current_viewer_index = new_index
+        inner_viewer_img.src = target_img_obj.src # 主图换成新图
+        reset_viewer_zoom(update_ui=False)
+        
+        # 瞬间归位（关闭动画）
+        swipe_anim_container.animate_offset = None
+        preload_container.animate_offset = None
+        
+        swipe_anim_container.offset = MyOffset(0, 0) # 主图回正
+        preload_container.offset = MyOffset(1.0, 0)  # 预加载图踢开
+        preload_container.visible = False
+        
+        try:
+            swipe_anim_container.update()
+            preload_container.update()
+        except: pass
+        
+        # 6. 更新UI信息
+        meta = getattr(target_img_obj, "data", None)
+        if meta:
+            viewer_info_prompt.value = meta.get("prompt", "无")
+            viewer_info_neg.value = meta.get("negative_prompt", "无")
+        else:
+            viewer_info_prompt.value = "无数据"
+            viewer_info_neg.value = "无数据"
+        
+        sync_viewer_btns_state()
+        
+        # 更新按钮禁用状态
+        total = len(current_viewer_grid_images)
+        prev_btn.disabled = (current_viewer_index <= 0)
+        next_btn.disabled = (current_viewer_index >= total - 1)
+        
+        try: viewer_overlay.update()
+        except: pass
+        
+        # 解锁
+        is_animating = False
+        _viewer_drag_offset_x = 0
+
+    # 左右翻页按钮 (仅横屏) - 【修复】使用标准的 async wrapper 确保点击生效
+    async def on_prev_click(e):
+        await navigate_viewer(-1)
+
+    async def on_next_click(e):
+        await navigate_viewer(1)
+
+    prev_btn = ft.IconButton("chevron_left", icon_color="white", icon_size=30, bgcolor=get_opacity_color(0.3, "black"), on_click=on_prev_click, visible=False, tooltip="上一张")
+    next_btn = ft.IconButton("chevron_right", icon_color="white", icon_size=30, bgcolor=get_opacity_color(0.3, "black"), on_click=on_next_click, visible=False, tooltip="下一张")
+    
+    # 【关键修改】Viewer Stack布局重构，确保info overlay不影响image stack
+    # 这里定义各个独立的Container，后面在 update_viewer_layout_content 组装
+    
+    viewer_control_btns = []
+    def create_control_btn(icon_name, tooltip, func):
+        btn = ft.IconButton(icon=icon_name, icon_color="white", icon_size=20, tooltip=tooltip, on_click=func, bgcolor="transparent")
+        viewer_control_btns.append(btn)
+        return btn
+    
+    # --- 按钮逻辑 ---
+    async def on_viewer_save_local(e):
+        if inner_viewer_img.src:
+            img_obj = current_viewer_grid_images[current_viewer_index]
+            meta = getattr(img_obj, "data", None)
+            success = await save_image_to_local_folder(inner_viewer_img.src, meta)
+            if success:
+                img_obj.is_downloaded = True
+                sync_viewer_btns_state() 
+                try: viewer_overlay.update()
+                except: pass
+                if hasattr(img_obj, "associated_dl_btn"): mark_btn_downloaded(img_obj.associated_dl_btn)
+                if hasattr(img_obj, "associated_browser_btn"): mark_btn_downloaded(img_obj.associated_browser_btn)
+
+    async def on_viewer_browser_dl(e):
+        if inner_viewer_img.src:
+            img_obj = current_viewer_grid_images[current_viewer_index]
+            meta = getattr(img_obj, "data", None)
+            success = await download_via_local_server(inner_viewer_img.src, meta)
+            if success:
+                img_obj.is_downloaded = True
+                sync_viewer_btns_state()
+                try: viewer_overlay.update()
+                except: pass
+                if hasattr(img_obj, "associated_dl_btn"): mark_btn_downloaded(img_obj.associated_dl_btn)
+                if hasattr(img_obj, "associated_browser_btn"): mark_btn_downloaded(img_obj.associated_browser_btn)
+
+    def toggle_viewer_info(e):
+        nonlocal is_viewer_info_open
+        is_viewer_info_open = not is_viewer_info_open
+        btn_info.icon = "info" if is_viewer_info_open else "info_outline"
+        update_viewer_layout_content()
+    
+    def sync_viewer_btns_state():
+        if 0 <= current_viewer_index < len(current_viewer_grid_images):
+            img_obj = current_viewer_grid_images[current_viewer_index]
+            is_downloaded = getattr(img_obj, "is_downloaded", False)
+            if is_downloaded:
+                mark_btn_downloaded(viewer_dl_btn)
+                mark_btn_downloaded(btn_browser_dl)
+            else:
+                viewer_dl_btn.icon = "save_alt"
+                viewer_dl_btn.icon_color = current_primary_color
+                viewer_dl_btn.disabled = False
+                viewer_dl_btn.tooltip = "保存到本地 (T2I目录)"
+                btn_browser_dl.icon = "public"
+                btn_browser_dl.icon_color = current_primary_color
+                btn_browser_dl.disabled = False
+                btn_browser_dl.tooltip = "浏览器下载"
+                
+                try: viewer_dl_btn.update()
+                except: pass
+                try: btn_browser_dl.update()
+                except: pass
+
+    btn_info = create_control_btn("info_outline", "显示/隐藏详细信息", toggle_viewer_info)
+    btn_reset = create_control_btn("restart_alt", "重置大小", lambda e: reset_viewer_zoom(True))
+    viewer_dl_btn = create_control_btn("save_alt", "保存到本地 (I2I_Edits)", on_viewer_save_local)
+    btn_browser_dl = create_control_btn("public", "浏览器下载", on_viewer_browser_dl)
+    btn_close = create_control_btn("close", "关闭", close_viewer)
+
+    # 底部控制栏
+    viewer_controls_row = ft.Row(
+        controls=[btn_info, btn_reset, btn_browser_dl, viewer_dl_btn, ft.Container(width=1, height=20, bgcolor="white54"), btn_close], 
+        alignment=ft.MainAxisAlignment.END, spacing=5
+    )
+    
+    viewer_controls_container = ft.Container(
+        content=viewer_controls_row,
+        padding=5,
+        bgcolor=ft.Colors.TRANSPARENT 
+    )
+
+    # ================= 布局动态构建核心 (完美显隐版) =================
+    
+    # 0. 重新确保信息面板内部结构的完整性
+    viewer_text_col = ft.Column([
+        # 初始为空，由 update_viewer_layout_content 填充
+    ], scroll=ft.ScrollMode.ALWAYS, expand=True)
+
+    viewer_info_container = ft.Container(
+        content=viewer_text_col,
+        padding=15, 
+        bgcolor=ft.Colors.TRANSPARENT, 
+        border_radius=ft.border_radius.only(top_left=15, top_right=15),
+        expand=True
+    )
+
+    # 1. 定义信息面板的外壳 (竖屏动画用)
+    viewer_info_wrapper = ft.Container(
+        content=viewer_info_container,
+        height=0,  # 默认高度为0 (隐藏)
+        animate=MyAnimation(300, "easeOut") if MyAnimation else None,
+        clip_behavior=ft.ClipBehavior.HARD_EDGE, 
         bgcolor=ft.Colors.TRANSPARENT,
     )
 
-    t2i_result_wrapper = ft.Container(content=t2i_app.get_results_content(), visible=True, expand=True)
-    i2i_result_wrapper = ft.Container(content=i2i_app.get_results_content(), visible=False, expand=True)
-    page2_stack = ft.Stack([t2i_result_wrapper, i2i_result_wrapper], expand=True)
+    # 2. 定义左侧主区域
+    viewer_main_column = ft.Column(
+        spacing=0,
+        controls=[
+            ft.Container(
+                content=ft.Stack([
+                    viewer_background_container, # 图片显示层
+                    ft.Container(content=prev_btn, left=15, top=0, bottom=0, alignment=ft.alignment.center_left, width=60),
+                    ft.Container(content=next_btn, right=15, top=0, bottom=0, alignment=ft.alignment.center_right, width=60),
+                ], expand=True),
+                expand=True, 
+            ),
+            viewer_info_wrapper, # 竖屏时用于顶起图片的容器
+            ft.Container(content=viewer_controls_container, bgcolor=ft.Colors.TRANSPARENT)
+        ],
+        expand=True
+    )
 
-    # --- 5.2 遮罩层 ---
-    mask = ft.Container(
-        bgcolor=utils.get_opacity_color(0.3, "black"),
-        left=0, right=0, top=0, bottom=0, 
-        visible=False, animate_opacity=300, opacity=0,
-        on_click=lambda e: toggle_sidebar(False) 
+    # 3. 定义宽屏侧边栏的文本容器
+    wide_sidebar_info_col = ft.Column(scroll=ft.ScrollMode.ALWAYS, expand=True)
+
+    # 4. 定义宽屏侧边栏 (默认隐藏)
+    wide_sidebar_container = ft.Container(
+        width=320,
+        bgcolor=ft.Colors.TRANSPARENT,
+        border=ft.border.only(left=ft.BorderSide(1, "white24")),
+        content=ft.Column([
+            ft.Container(content=wide_sidebar_info_col, padding=15, expand=True),
+            ft.Divider(height=1, color="white24"),
+        ], spacing=0, expand=True),
+        visible=False # 初始状态设为隐藏
+    )
+
+    # 5. 最终布局
+    final_viewer_layout = ft.Row(
+        controls=[
+            viewer_main_column,
+            wide_sidebar_container
+        ],
+        spacing=0,
+        expand=True
+    )
+
+    # 6. 布局更新逻辑
+    def update_viewer_layout_content():
+        bg_color = get_dropdown_bgcolor()
+        
+        # 同步背景色
+        viewer_info_wrapper.bgcolor = bg_color
+        viewer_info_container.bgcolor = bg_color
+        wide_sidebar_container.bgcolor = bg_color
+        
+        # 准备组件列表
+        info_controls_list = [
+            ft.Row([viewer_title_prompt, viewer_copy_prompt_btn], alignment="spaceBetween"),
+            ft.Container(content=viewer_info_prompt, padding=ft.padding.only(bottom=5)), 
+            ft.Divider(height=10, color="white24"),
+            ft.Row([viewer_title_neg, viewer_copy_neg_btn], alignment="spaceBetween"),
+            ft.Container(content=viewer_info_neg),
+        ]
+
+        if is_wide_mode:
+            # === 宽屏模式 ===
+            # 【关键修改】侧边栏的显隐现在完全由 is_viewer_info_open 控制
+            wide_sidebar_container.visible = is_viewer_info_open 
+            
+            viewer_main_column.controls[2].bgcolor = bg_color
+
+            # 搬运组件到右侧
+            viewer_text_col.controls.clear() 
+            wide_sidebar_info_col.controls = info_controls_list 
+            
+            # 隐藏竖屏的Wrapper
+            viewer_info_wrapper.height = 0
+            
+            prev_btn.visible = True
+            next_btn.visible = True
+
+        else:
+            # === 竖屏模式 ===
+            wide_sidebar_container.visible = False
+            
+            if is_viewer_info_open:
+                viewer_main_column.controls[2].bgcolor = bg_color 
+            else:
+                viewer_main_column.controls[2].bgcolor = ft.Colors.TRANSPARENT
+            
+            # 搬运组件到底部
+            wide_sidebar_info_col.controls.clear() 
+            viewer_text_col.controls = info_controls_list 
+
+            # 控制Wrapper高度
+            if is_viewer_info_open:
+                viewer_info_wrapper.height = 200 
+                viewer_info_container.visible = True
+                viewer_info_wrapper.opacity = 1
+            else:
+                viewer_info_wrapper.height = 0   
+                viewer_info_wrapper.opacity = 0
+                
+            prev_btn.visible = False
+            next_btn.visible = False
+
+        # 强制刷新
+        try:
+            viewer_text_col.update()
+            wide_sidebar_info_col.update()
+            if viewer_overlay.visible: viewer_overlay.update()
+            viewer_info_wrapper.update()
+            viewer_main_column.update()
+            wide_sidebar_container.update()
+        except: pass
+
+    # 7. 查看器覆盖层 (【修复】确保它没有缩进到上面的函数内)
+    viewer_overlay = ft.Container(
+        content=final_viewer_layout, 
+        visible=False, 
+        expand=True, 
+        bgcolor=BG_DARK, 
+        top=0, left=0, right=0, bottom=0
+    )
+
+    def show_image_viewer(src):
+        if not src: return
+        nonlocal current_viewer_grid_images, current_viewer_index, is_viewer_info_open
+        
+        # 【关键】每次打开大图时，强制重置为“不显示信息”
+        is_viewer_info_open = False 
+        btn_info.icon = "info_outline"
+        
+        bg = get_viewer_bgcolor_dynamic()
+        viewer_overlay.bgcolor = bg
+        viewer_background_container.bgcolor = bg
+        
+        current_viewer_grid_images = []
+        target_index = 0
+        idx_counter = 0
+
+        for ctrl in results_grid.controls:
+            try:
+                stack = ctrl.content
+                img_container = stack.controls[1]
+                img_obj = img_container.content
+                if img_obj.src:
+                    current_viewer_grid_images.append(img_obj)
+                    if img_obj.src == src:
+                        target_index = idx_counter
+                    idx_counter += 1
+            except: pass
+        
+        current_viewer_index = target_index
+        inner_viewer_img.src = src
+        reset_viewer_zoom(update_ui=False) 
+        
+        img_obj = current_viewer_grid_images[current_viewer_index]
+        meta = getattr(img_obj, "data", None)
+        if meta:
+            viewer_info_prompt.value = meta.get("prompt", "无")
+            viewer_info_neg.value = meta.get("negative_prompt", "无")
+        else:
+            viewer_info_prompt.value = "无数据"
+            viewer_info_neg.value = "无数据"
+            
+        if is_wide_mode:
+            viewer_dl_btn.visible = True
+            btn_browser_dl.visible = False
+        else:
+            viewer_dl_btn.visible = False
+            btn_browser_dl.visible = True
+            
+        update_viewer_layout_content()
+        sync_viewer_btns_state()
+
+        if not is_wide_mode:
+            gallery_control_gesture.visible = False
+            gallery_control_gesture.update()
+
+        viewer_overlay.visible = True
+        viewer_overlay.update()
+
+    def get_all_models():
+        custom_models = []
+        try:
+            custom_text = stored_custom_models
+            for line in custom_text.strip().split('\n'):
+                if not line.strip(): continue
+                parts = line.strip().split(None, 1)
+                if len(parts) >= 2:
+                    custom_models.append({"key": parts[1], "text": parts[0]})
+        except: pass
+        return DEFAULT_MODEL_OPTIONS + custom_models
+
+    def refresh_model_dropdown():
+        all_models = get_all_models()
+        model_dropdown.options = [ft.dropdown.Option(m["key"], m["text"]) for m in all_models]
+        if model_dropdown.value and not any(m["key"] == model_dropdown.value for m in all_models):
+            model_dropdown.value = all_models[0]["key"] if all_models else None
+        model_dropdown.update()
+
+    custom_models_input = ft.TextField(
+        hint_text="请输入模型，每行一个，格式：\n模型显示名称 模型地址",
+        multiline=True, min_lines=10, max_lines=15, text_size=12, border_radius=10, 
+    )
+
+    async def save_custom_models(e):
+        nonlocal stored_custom_models
+        text = custom_models_input.value or ""
+        stored_custom_models = text
+        await save_config("custom_models", text)
+        refresh_model_dropdown()
+        safe_close_dialog(custom_model_dialog)
+        page.snack_bar = ft.SnackBar(ft.Text("自定义模型已保存"), open=True)
+        page.update()
+
+    custom_model_dialog = ft.AlertDialog(
+        title=ft.Text("自定义模型", weight="bold", size=14),
+        modal=True, surface_tint_color=ft.Colors.TRANSPARENT,
+        content=ft.Container(
+            width=300, 
+            content=ft.Column([
+                ft.Text("模型列表（每行一个，格式：显示名称 模型地址）", size=12, color="grey"), 
+                ft.Container(height=8), 
+                custom_models_input
+            ], tight=True, spacing=0)
+        ),
+        actions=[
+            ft.TextButton("取消", on_click=lambda e: safe_close_dialog(custom_model_dialog)), 
+            ft.ElevatedButton("保存并应用", bgcolor=current_primary_color, color="white", on_click=save_custom_models)
+        ],
+        actions_alignment="end"
+    )
+
+    def open_custom_model_dialog(e):
+        try: custom_models_input.value = stored_custom_models
+        except: pass
+        safe_open_dialog(custom_model_dialog)
+
+    def on_model_search_change(e):
+        query = (e.control.value or "").lower().strip()
+        all_models = get_all_models()
+        if query: filtered = [m for m in all_models if query in m["text"].lower() or query in m["key"].lower()]
+        else: filtered = all_models
+        model_dropdown.options = [ft.dropdown.Option(m["key"], m["text"]) for m in filtered]
+        current_value = model_dropdown.value
+        if filtered:
+            if not any(m["key"] == current_value for m in filtered): model_dropdown.value = filtered[0]["key"]
+        else: model_dropdown.value = None
+        model_dropdown.update()
+
+    # --- 模型下拉菜单相关逻辑 ---
+    def on_model_change(e):
+        update_upload_area()
+
+    model_search_field = ft.TextField(
+        hint_text="搜索...", text_size=12, height=INPUT_HEIGHT,
+        content_padding=ft.padding.symmetric(horizontal=10, vertical=0), border_radius=8, bgcolor="transparent",
+        border_color=get_border_color(), border_width=1, on_change=on_model_search_change, width=SEARCH_WIDTH 
+    )
+
+    model_dropdown = ft.Dropdown(
+        options=[ft.dropdown.Option(m["key"], m["text"]) for m in get_all_models()],
+        value=DEFAULT_MODEL_OPTIONS[2]["key"], # 默认选中第3个
+        text_size=14, content_padding=ft.padding.only(left=10, right=10, bottom=5),
+        border_color="transparent", border_width=0, fill_color=get_dropdown_bgcolor(), bgcolor=get_dropdown_fill_color(),
+        focused_bgcolor=ft.Colors.TRANSPARENT, expand=True,
+        on_change=on_model_change # ⭐️ 绑定变更事件
     )
     
-    # --- 5.3 组装 T2I/I2I 页面容器 ---
-    page1_content_col = ft.Column([
-        ft.Container(content=page1_stack, expand=True, padding=ft.padding.only(top=10, bottom=10)), 
-        fixed_bottom_action_bar
-    ], spacing=0, expand=True)
+    model_dropdown_container = ft.Container(content=model_dropdown, height=INPUT_HEIGHT, border=ft.border.all(1, get_border_color()), border_radius=8, expand=True, alignment=ft.alignment.center_left)
+    custom_model_btn = ft.ElevatedButton("自定义", height=INPUT_HEIGHT, width=CUSTOM_BTN_WIDTH, bgcolor="transparent", color=current_primary_color, style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8), elevation=0, padding=0, side=ft.BorderSide(1, get_border_color())), on_click=open_custom_model_dialog)
+    model_row = ft.Row([model_dropdown_container, model_search_field, custom_model_btn], spacing=5)
 
+    def handle_translate(e, input_field, to_lang):
+        text = input_field.value
+        if not text: return
+        res = translate_text(text, to_lang)
+        if res:
+            input_field.value = res
+            input_field.update()
+
+    def show_prompt_actions(e, action_row):
+        action_row.visible = True 
+        action_row.update()
+        action_row.opacity = 1    
+        action_row.update()
+
+    async def hide_prompt_actions(e, action_row):
+        await asyncio.sleep(0.2)
+        action_row.opacity = 0    
+        action_row.update()
+        await asyncio.sleep(0.35) 
+        action_row.visible = False 
+        action_row.update()
+
+    async def on_prompt_blur(e): await hide_prompt_actions(e, prompt_trans_row)
+    async def on_neg_blur(e): await hide_prompt_actions(e, neg_trans_row)
+
+    # ==========================================
+    #      【新增】缺失的元数据读取函数
+    # ==========================================
+    def apply_metadata_from_path(file_path):
+        if not file_path: return
+        try:
+            with open(file_path, 'rb') as f:
+                image_bytes = f.read()
+            
+            # 使用全局工具函数提取信息
+            meta = extract_metadata_from_png(image_bytes)
+            
+            if meta and isinstance(meta, dict):
+                has_update = False
+                if "prompt" in meta:
+                    prompt_input.value = meta["prompt"]
+                    has_update = True
+                if "negative_prompt" in meta:
+                    neg_prompt_input.value = meta["negative_prompt"]
+                    has_update = True
+                
+                if has_update:
+                    prompt_input.update()
+                    neg_prompt_input.update()
+                    page.snack_bar = ft.SnackBar(ft.Text("✅ 已读取元数据"), open=True)
+                    page.update()
+        except Exception as e:
+            print(f"元数据读取失败: {e}")
+
+    # ==========================================
+    #      ⭐️ 上传区域逻辑与UI (已修复)
+    # ==========================================
+    upload_content_container = ft.Container()
+
+    def remove_image(idx):
+        if 0 <= idx < len(uploaded_files):
+            uploaded_files.pop(idx)
+            update_upload_area()
+
+    def update_upload_area():
+        # 判断当前模型是否支持多图
+        is_multi_mode = model_dropdown.value in MODELS_REQUIRING_LIST_INPUT
+        
+        placeholder = ft.Column([
+            ft.Icon("cloud_upload", size=30, color="grey"),
+            ft.Text("点击上传图片", size=12, color="grey"), 
+            ft.Text("支持多图模式" if is_multi_mode else "单图模式", size=10, color="grey")
+        ], alignment="center", horizontal_alignment="center", spacing=2)
+
+        if not uploaded_files:
+            upload_content_container.content = ft.Container(
+                content=placeholder, 
+                alignment=ft.alignment.center,
+                on_click=lambda _: upload_file_picker.pick_files(
+                    allow_multiple=is_multi_mode, 
+                    allowed_extensions=["png", "jpg", "jpeg", "webp"]
+                )
+            )
+            # 必须调用 update 才能刷新界面
+            upload_content_container.update()
+            return
+
+        if not is_multi_mode:
+            # 单图模式显示
+            file_path = uploaded_files[0]
+            img_view = ft.Image(src=file_path, fit=ft.ImageFit.CONTAIN, border_radius=8)
+            clear_btn = ft.Container(
+                content=ft.IconButton(icon="close", icon_size=20, icon_color="red", on_click=lambda e: remove_image(0)),
+                top=5, right=5
+            )
+            upload_content_container.content = ft.Stack([
+                ft.Container(content=img_view, padding=5, alignment=ft.alignment.center),
+                clear_btn
+            ])
+            # 点击图片也可以重新上传
+            upload_content_container.on_click = lambda _: upload_file_picker.pick_files(allow_multiple=False, allowed_extensions=["png", "jpg", "jpeg", "webp"])
+        else:
+            # 多图模式显示
+            thumbs = []
+            for i, path in enumerate(uploaded_files):
+                img_thumb = ft.Image(src=path, fit=ft.ImageFit.COVER, width=100, height=100, border_radius=8)
+                rm_btn = ft.Container(
+                    content=ft.IconButton(icon="close", icon_size=16, icon_color="white", on_click=lambda e, idx=i: remove_image(idx)),
+                    bgcolor="#88000000", border_radius=15, width=24, height=24, top=2, right=2
+                )
+                thumb_container = ft.Container(
+                    width=100, height=100,
+                    content=ft.Stack([img_thumb, rm_btn]),
+                    border=ft.border.all(1, get_border_color()),
+                    border_radius=8
+                )
+                thumbs.append(thumb_container)
+
+            add_btn = ft.Container(
+                width=100, height=100,
+                border=ft.border.all(1, get_border_color()),
+                border_radius=8,
+                bgcolor=get_opacity_color(0.1, current_primary_color),
+                alignment=ft.alignment.center,
+                content=ft.Icon("add", size=30, color="grey"),
+                on_click=lambda _: upload_file_picker.pick_files(allow_multiple=True, allowed_extensions=["png", "jpg", "jpeg", "webp"])
+            )
+            thumbs.append(add_btn)
+            
+            upload_content_container.content = ft.Row(
+                thumbs, scroll=ft.ScrollMode.AUTO, spacing=10, alignment="start"
+            )
+            upload_content_container.on_click = None
+
+        upload_content_container.update()
+
+    def on_upload_file_picked(e: ft.FilePickerResultEvent):
+        if e.files:
+            try:
+                is_multi = model_dropdown.value in MODELS_REQUIRING_LIST_INPUT
+                new_paths = [f.path for f in e.files]
+                
+                if is_multi:
+                    uploaded_files.extend(new_paths)
+                else:
+                    uploaded_files.clear()
+                    uploaded_files.append(new_paths[0])
+
+            except Exception as err:
+                print(f"文件处理错误: {err}")
+            
+            # 无论如何都要刷新UI
+            update_upload_area()
+
+    upload_file_picker = ft.FilePicker(on_result=on_upload_file_picked)
+    page.overlay.append(upload_file_picker)
+
+    upload_container = ft.Container(
+        content=upload_content_container,
+        height=140,
+        border=ft.border.all(1, get_border_color()),
+        border_radius=10,
+        bgcolor=get_dropdown_bgcolor(),
+        padding=10,
+        animate=MyAnimation(300, "easeOut") if MyAnimation else None
+    )
+
+    meta_file_picker = ft.FilePicker(on_result=lambda e: apply_metadata_from_path(e.files[0].path) if e.files else None)
+    page.overlay.append(meta_file_picker)
+
+    # ⭐️ 修改了 hint_text
+    prompt_input = ft.TextField(
+        hint_text="编辑指令 (例如: 把衣服改成红色)...", multiline=True, expand=True, text_size=13, bgcolor="transparent", 
+        filled=False, border=ft.InputBorder.NONE, content_padding=ft.padding.only(left=10, top=10, right=10, bottom=32),
+        on_focus=lambda e: show_prompt_actions(e, prompt_trans_row), on_blur=on_prompt_blur,
+    )
+    
+    prompt_trans_row = ft.Row(
+        [
+         ft.IconButton("folder_open", icon_size=16, tooltip="读取元数据文件", on_click=lambda _: meta_file_picker.pick_files(allow_multiple=False, allowed_extensions=["png"])),
+         ft.IconButton("language", icon_size=16, tooltip="转英文", on_click=lambda e: handle_translate(e, prompt_input, "en")),
+         ft.IconButton("translate", icon_size=16, tooltip="转中文", on_click=lambda e: handle_translate(e, prompt_input, "zh"))
+        ], right=5, bottom=2, opacity=0, animate_opacity=300, visible=False 
+    )
+
+    prompt_container = ft.Container(
+        content=ft.Stack([prompt_input, prompt_trans_row], expand=True), 
+        height=120,  # <--- 【修改点】强制固定高度为 120
+        # expand=True, <--- 【修改点】删除了 expand，不再自动撑开
+        border=ft.border.all(1, get_border_color()), border_radius=10, on_click=lambda e: prompt_input.focus()
+    )
+
+    neg_prompt_input = ft.TextField(
+        hint_text="负面提示词...", multiline=True, min_lines=2, max_lines=6, value="噪点，模糊，低画质，色调艳丽，过曝，细节模糊不清，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指",
+        text_size=13, bgcolor="transparent", filled=False, border=ft.InputBorder.NONE, content_padding=ft.padding.only(left=10, top=10, right=10, bottom=32),
+        on_focus=lambda e: show_prompt_actions(e, neg_trans_row), on_blur=on_neg_blur 
+    )
+
+    neg_trans_row = ft.Row(
+        [
+         ft.IconButton("language", icon_size=16, tooltip="转英文", on_click=lambda e: handle_translate(e, neg_prompt_input, "en")),
+         ft.IconButton("translate", icon_size=16, tooltip="转中文", on_click=lambda e: handle_translate(e, neg_prompt_input, "zh"))
+        ], right=5, bottom=2, opacity=0, animate_opacity=300, visible=False 
+    )
+
+    neg_prompt_container = ft.Container(
+        content=ft.Stack([neg_prompt_input, neg_trans_row]), border=ft.border.all(1, get_border_color()), border_radius=10, alignment=ft.alignment.top_left, on_click=lambda e: neg_prompt_input.focus()
+    )
+
+    size_dropdown = ft.Dropdown(
+        options=[ft.dropdown.Option(s["key"], s["text"]) for s in SIZE_OPTIONS], value="AutoSize", # 默认 AutoSize
+        text_size=14, content_padding=ft.padding.only(left=10, right=10, bottom=5), border_color="transparent", border_width=0,
+        fill_color=get_dropdown_bgcolor(), bgcolor=get_dropdown_fill_color(), focused_bgcolor=ft.Colors.TRANSPARENT, expand=True
+    )
+    
+    size_dropdown_container = ft.Container(content=size_dropdown, height=INPUT_HEIGHT, border=ft.border.all(1, get_border_color()), border_radius=8, expand=True, alignment=ft.alignment.center_left)
+    
+    custom_size_w = ft.TextField(label="宽度", expand=True, keyboard_type="number", text_size=12, height=40, content_padding=10)
+    custom_size_h = ft.TextField(label="高度", expand=True, keyboard_type="number", text_size=12, height=40, content_padding=10)
+
+    def confirm_custom_size(e):
+        w = custom_size_w.value
+        h = custom_size_h.value
+        if w and h:
+            new_key = f"{w}x{h}"
+            exists = False
+            for opt in size_dropdown.options:
+                if opt.key == new_key:
+                    exists = True
+                    break
+            if not exists: size_dropdown.options.insert(0, ft.dropdown.Option(new_key, f"{new_key} (自定义)"))
+            size_dropdown.value = new_key
+            size_dropdown.update()
+        safe_close_dialog(custom_size_dialog)
+
+    custom_size_dialog = ft.AlertDialog(
+        title=ft.Text("自定义分辨率", size=14), surface_tint_color=ft.Colors.TRANSPARENT,
+        content=ft.Container(
+            width=300, padding=ft.padding.symmetric(horizontal=10),
+            content=ft.Row([custom_size_w, ft.Text("x", size=14), custom_size_h], alignment="center")
+        ),
+        actions=[
+            ft.TextButton("取消", on_click=lambda e: safe_close_dialog(custom_size_dialog)), 
+            ft.ElevatedButton("确定", on_click=confirm_custom_size, bgcolor=current_primary_color, color="white")
+        ],
+        actions_alignment="end"
+    )
+
+    custom_size_btn = ft.ElevatedButton("自定义", height=INPUT_HEIGHT, width=CUSTOM_BTN_WIDTH, bgcolor="transparent", color=current_primary_color, style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=8), elevation=0, padding=0, side=ft.BorderSide(1, get_border_color())), on_click=lambda e: safe_open_dialog(custom_size_dialog))
+    size_row = ft.Row([size_dropdown_container, custom_size_btn], spacing=5)
+
+    def create_slider_row(label, min_v, max_v, def_v, step=1):
+        slider = ft.Slider(
+            min=min_v, 
+            max=max_v, 
+            value=def_v, 
+            label="{value}", 
+            expand=True, 
+            active_color=current_primary_color
+        )
+        
+        val_text = ft.Text(str(def_v), width=40, size=14, text_align="center")
+
+        def on_change(e):
+            raw_val = e.control.value
+            snapped_val = round(raw_val / step) * step
+            if step < 1:
+                val_text.value = f"{snapped_val:.1f}"
+            else:
+                val_text.value = str(int(snapped_val))
+            val_text.update()
+            
+        slider.on_change = on_change
+        return ft.Row([ft.Text(label, size=14, width=60, color="grey"), slider, val_text], alignment="center", vertical_alignment="center"), slider, val_text
+
+    initial_key_count = max(1, len(current_api_keys))
+    batch_row, batch_slider, batch_val_text = create_slider_row("生图数量", 1, max(1, initial_key_count), initial_key_count)
+    steps_row, steps_slider, steps_val_text = create_slider_row("生图步数", 5, 100, 30, 5) 
+    guidance_row, guidance_slider, guidance_val_text = create_slider_row("引导系数", 1, 20, 3.5, 0.5) 
+
+    def validate_seed(e):
+        if not seed_input.value or not seed_input.value.strip():
+            seed_input.value = "-1"
+            seed_input.update()
+    seed_input = ft.TextField(
+        value="-1", 
+        text_size=12, 
+        height=INPUT_HEIGHT, 
+        content_padding=ft.padding.symmetric(horizontal=10, vertical=0),
+        border_radius=8, 
+        bgcolor="transparent", 
+        border_color=get_border_color(), 
+        border_width=1, 
+        keyboard_type="number", 
+        expand=True,
+        on_blur=validate_seed  
+    )
+    seed_row = ft.Row([ft.Text("随机种子", size=14, width=60, color="grey"), seed_input], alignment="center", vertical_alignment="center")
+
+    # ⭐️ 修改了文本和图标
+    generate_btn = ft.ElevatedButton(
+        "开始编辑", icon="auto_fix_high", bgcolor=current_primary_color, color="white", height=50, style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)), width=float("inf")
+    )
+
+    results_grid = ft.GridView(expand=True, runs_count=None, max_extent=350, child_aspect_ratio=1.0, spacing=10, run_spacing=10, padding=10)
+    
+    # ================= 5. 结果卡片 UI (修改版 - 带Loading动画) =================
+    
+    def create_result_card_ui(index):
+        img = ft.Image(src="", fit=ft.ImageFit.CONTAIN, visible=False, expand=True, animate_opacity=300, border_radius=10)
+        img.is_downloaded = False # 初始化标记
+        
+        # --- 🎨 新增：加载动画组件 ---
+        # 1. 定义圆圈动画 (颜色跟随当前主题)
+        loading_ring = ft.ProgressRing(width=25, height=25, stroke_width=3, color=current_primary_color)
+        
+        # 2. 定义状态文字 (颜色跟随当前主题，稍微缩小一点字号显得精致)
+        status_text = ft.Text(f"排队中...", size=11, color=current_primary_color, text_align="center")
+        
+        # 3. 将它们垂直排列
+        # 将 ring 绑定到 text 对象上，方便后续逻辑函数调用
+        status_text.associated_ring = loading_ring 
+
+        loading_col = ft.Column(
+            controls=[
+                loading_ring,
+                ft.Container(height=5), # 间距
+                status_text
+            ],
+            alignment=ft.MainAxisAlignment.CENTER,
+            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+            spacing=0
+        )
+
+        overlay_prompt = ft.Text("", size=11, color=current_primary_color, selectable=True)
+        overlay_neg = ft.Text("", size=11, color=current_primary_color, selectable=True)
+        
+        def copy_overlay_text(txt): copy_text(txt)
+
+        meta_overlay = ft.Container(
+            visible=False,
+            bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.WHITE), 
+            blur=ft.Blur(10, 10, ft.BlurTileMode.MIRROR), 
+            padding=10, alignment=ft.alignment.top_left,
+            content=ft.Column([
+                ft.Row([ft.Text("Prompt", size=10, color=current_primary_color, weight="bold"), ft.IconButton("content_copy", icon_size=12, icon_color=current_primary_color, on_click=lambda e: copy_overlay_text(overlay_prompt.value))], alignment="spaceBetween"),
+                overlay_prompt, 
+                ft.Divider(height=10, color=current_primary_color),
+                ft.Row([ft.Text("Negative", size=10, color=current_primary_color, weight="bold"), ft.IconButton("content_copy", icon_size=12, icon_color=current_primary_color, on_click=lambda e: copy_overlay_text(overlay_neg.value))], alignment="spaceBetween"),
+                overlay_neg
+            ], scroll=ft.ScrollMode.HIDDEN), on_click=lambda e: None 
+        )
+
+        def toggle_meta_overlay(e):
+            meta = getattr(img, "data", {})
+            if meta:
+                overlay_prompt.value = meta.get("prompt", "")
+                overlay_neg.value = meta.get("negative_prompt", "")
+                meta_overlay.visible = not meta_overlay.visible
+                meta_overlay.update()
+        
+        btn_info = ft.IconButton(icon="info_outline", icon_color=current_primary_color, icon_size=18, tooltip="显示提示词", visible=False, on_click=toggle_meta_overlay)
+        
+        btn_browser = ft.IconButton(icon="public", icon_color=current_primary_color, icon_size=18, tooltip="浏览器下载", visible=False)
+        btn_dl = ft.IconButton(icon="save_alt", icon_color=current_primary_color, icon_size=18, tooltip="保存到T2I文件夹", visible=False)
+
+        async def on_browser_click(e):
+            if img.src:
+                meta = getattr(img, "data", None)
+                success = await download_via_local_server(img.src, metadata=meta)
+                if success:
+                    img.is_downloaded = True
+                    mark_btn_downloaded(btn_browser)
+                    mark_btn_downloaded(btn_dl)
+        
+        async def on_dl_click(e):
+            if img.src:
+                meta = getattr(img, "data", None)
+                success = await save_image_to_local_folder(img.src, metadata=meta)
+                if success:
+                    img.is_downloaded = True
+                    mark_btn_downloaded(btn_dl)
+                    mark_btn_downloaded(btn_browser) 
+
+        btn_browser.on_click = on_browser_click
+        btn_dl.on_click = on_dl_click
+        
+        # 互相关联
+        img.associated_browser_btn = btn_browser
+        img.associated_dl_btn = btn_dl
+        
+        img_container = ft.Container(content=img, expand=True, border_radius=10, on_click=lambda e: show_image_viewer(img.src) if img.src else None)
+        action_bar = ft.Row([btn_info, btn_browser, btn_dl], alignment="end", spacing=0)
+        
+        # ⭐️ 布局修改：底层容器现在 content 是 loading_col
+        card_stack = ft.Stack([
+            ft.Container(content=loading_col, alignment=ft.alignment.center, bgcolor=get_opacity_color(0.05, "black"), border_radius=10, expand=True),
+            img_container, meta_overlay, ft.Container(content=action_bar, right=0, bottom=0) 
+        ], expand=True)
+
+        card = ft.Container(content=card_stack, bgcolor="transparent", border_radius=10, clip_behavior=ft.ClipBehavior.HARD_EDGE)
+
+        return card, img, status_text, btn_dl, btn_info, btn_browser
+
+    async def run_gen(e):
+        # 【修改】移除了这里的跳转逻辑，推迟到上传成功后
+        
+        nonlocal current_api_keys
+        # ... (保持原有的 Key校验、文件校验、Prompt校验不变) ...
+        if not prompt_input.value:
+            page.snack_bar = ft.SnackBar(ft.Text("请输入编辑指令"), open=True)
+            page.update()
+            return
+
+        # 【修改】移除了这里的 switch_t2i_page(1)
+
+        generate_btn.disabled = True
+        generate_btn.text = "上传图片中..."
+        generate_btn.update()
+        generate_btn.text = "上传图片中..."
+        generate_btn.update()
+        
+        # ⭐️ 1. 智能设置 Grid 比例 (AutoSize)
+        target_size = size_dropdown.value
+        aspect_ratio = 1.0
+        
+        if target_size == "AutoSize":
+            # 尝试从第一张图获取比例
+            if uploaded_files:
+                dims = get_image_size(uploaded_files[0])
+                if dims:
+                    w, h = dims
+                    aspect_ratio = w / h
+        else:
+            try:
+                parts = target_size.split('x')
+                if len(parts) == 2:
+                    w, h = int(parts[0]), int(parts[1])
+                    aspect_ratio = w / h
+            except: pass
+            
+        results_grid.child_aspect_ratio = aspect_ratio
+        
+        # ⭐️ 2. 智能上传/复用 URL
+        image_url_param = None
+        current_model = model_dropdown.value
+        is_multi = current_model in MODELS_REQUIRING_LIST_INPUT
+        
+        try:
+            uploaded_urls_list = []
+            for path in uploaded_files:
+                # 调用智能上传函数（含缓存）
+                url = await upload_image_to_host(path)
+                if url:
+                    uploaded_urls_list.append(url)
+                else:
+                    raise Exception(f"图片上传失败: {os.path.basename(path)}")
+            
+            if is_multi:
+                image_url_param = uploaded_urls_list
+            else:
+                image_url_param = uploaded_urls_list[0]
+                
+        except Exception as up_err:
+            page.snack_bar = ft.SnackBar(ft.Text(str(up_err)), open=True)
+            generate_btn.disabled = False
+            generate_btn.text = "开始编辑"
+            generate_btn.update()
+            return
+        if is_wide_mode and left_panel_visible: 
+            toggle_left_panel(None)
+        
+        if not is_wide_mode:
+            switch_t2i_page(1)
+            
+        generate_btn.text = "任务提交中..."
+        generate_btn.update()
+
+        batch_count = int(batch_slider.value)
+        results_grid.controls.clear()
+        
+        tasks_ui = []
+        for i in range(batch_count):
+            # 使用 T2I 原有的卡片创建函数 (返回 6 个元素)
+            card, img, status, btn_dl, btn_info, btn_browser = create_result_card_ui(i)
+            results_grid.controls.append(card)
+            tasks_ui.append((img, status, btn_dl, btn_info, btn_browser))
+        
+        results_grid.update()
+        page.update()
+        
+        async def generate_single_image(idx, api_key, ui_refs):
+            img_ref, status_ref, dl_ref, info_ref, browser_ref = ui_refs
+            
+            # 辅助函数：控制 Ring 的显隐
+            def toggle_ring(visible):
+                if hasattr(status_ref, "associated_ring"):
+                    status_ref.associated_ring.visible = visible
+                    try: status_ref.associated_ring.update()
+                    except: pass
+
+            try:
+                # 开始时显示动画
+                toggle_ring(True)
+                status_ref.value = "提交中..."
+                status_ref.color = current_primary_color
+                status_ref.update()
+                
+                headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                
+                raw_seed = seed_input.value
+                if not raw_seed or not raw_seed.strip():
+                    seed_val = -1
+                else:
+                    try: seed_val = int(raw_seed)
+                    except ValueError: seed_val = -1
+                
+                if seed_val == -1: seed_val = random.randint(1, 10000000)
+                current_seed = seed_val + idx 
+
+                # ⭐️ 3. 构建 Payload
+                payload = {
+                    "model": current_model,
+                    "image_url": image_url_param, 
+                    "prompt": prompt_input.value,
+                    "negative_prompt": neg_prompt_input.value,
+                    "num_inference_steps": int(steps_val_text.value), 
+                    "guidance_scale": float(guidance_val_text.value),
+                    "num_images_per_prompt": 1, 
+                    "seed": current_seed
+                }
+                
+                if size_dropdown.value != "AutoSize":
+                    payload["size"] = size_dropdown.value
+
+                def do_post():
+                    return requests.post(
+                        f"{BASE_URL}v1/images/generations",
+                        headers={**headers, "X-ModelScope-Async-Mode": "true"},
+                        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                        timeout=20
+                    )
+                
+                res = await asyncio.to_thread(do_post)
+                res.raise_for_status()
+                task_id = res.json().get("task_id")
+                
+                if not task_id: raise Exception("无TaskID")
+
+                for _ in range(60): 
+                    await asyncio.sleep(2)
+                    def do_poll():
+                        return requests.get(
+                            f"{BASE_URL}v1/tasks/{task_id}", 
+                            headers={**headers, "X-ModelScope-Task-Type": "image_generation"}, 
+                            timeout=10
+                        )
+                    res_poll = await asyncio.to_thread(do_poll)
+                    data = res_poll.json()
+                    
+                    raw_status = data.get("task_status")
+                    cn_status = STATUS_TRANSLATIONS.get(raw_status, raw_status)
+                    
+                    if raw_status == "SUCCEED":
+                        # 成功时隐藏动画
+                        toggle_ring(False)
+
+                        output_images = data.get("output_images", [])
+                        if not output_images and "results" in data: output_images = data["results"] 
+                        
+                        if output_images:
+                            final_url = output_images[0].get("url", output_images[0]) if isinstance(output_images[0], dict) else output_images[0]
+                            img_ref.src = final_url
+                            
+                            payload["task_type"] = "image-edit"
+                            img_ref.data = payload 
+                            
+                            img_ref.visible = True
+                            info_ref.visible = True
+                            
+                            if is_wide_mode:
+                                dl_ref.visible = True
+                                browser_ref.visible = False
+                            else:
+                                dl_ref.visible = False
+                                browser_ref.visible = True
+
+                            status_ref.value = "" 
+                            img_ref.update()
+                            dl_ref.update()
+                            info_ref.update()
+                            browser_ref.update()
+                            status_ref.update()
+                        return True
+                    elif raw_status == "FAILED":
+                        raise Exception(data.get("message", "API Error"))
+                    else:
+                        status_ref.value = f"{cn_status}..." # 简化文案
+                        status_ref.update()
+                raise Exception("超时")
+
+            except Exception as e:
+                # 失败时隐藏动画
+                toggle_ring(False)
+                status_ref.value = "失败"
+                status_ref.tooltip = str(e)
+                status_ref.color = "red"
+                status_ref.update()
+                return False
+
+        tasks = []
+        for i in range(batch_count):
+            # ✅ 修正：使用 current_api_keys
+            key_to_use = current_api_keys[i % len(current_api_keys)]
+            tasks.append(asyncio.create_task(generate_single_image(i, key_to_use, tasks_ui[i])))
+        
+        await asyncio.gather(*tasks, return_exceptions=True)
+        generate_btn.disabled = False
+        generate_btn.text = "开始编辑"
+        generate_btn.update()
+
+    generate_btn.on_click = run_gen
+
+    def on_file_drop(e: ft.FilePickerResultEvent):
+        files = e.files
+        if not files: return
+
+    page.on_file_drop = on_file_drop
+
+    # ==========================================
+    #      【重构】页面布局与自适应逻辑
+    # ==========================================
+
+    # 1. 重新定义参数列表容器 (移除 generate_btn)
+    page1_scroll_col = ft.Column([
+            model_row,
+            ft.Container(height=8),
+            upload_container,   
+            ft.Container(height=8),
+            prompt_container,
+            ft.Container(height=8),
+            neg_prompt_container, 
+            ft.Container(height=8),
+            size_row, 
+            ft.Container(height=8),
+            batch_row,
+            ft.Container(height=5),
+            steps_row,
+            ft.Container(height=5),
+            guidance_row,
+            ft.Container(height=5),
+            seed_row,
+            ft.Container(height=15),
+            # 注意：generate_btn 已在此处被移除，移至底部固定栏
+    ], spacing=0, horizontal_alignment="stretch", expand=True, scroll=ft.ScrollMode.AUTO) # <--- 【修改点】添加了 scroll=ft.ScrollMode.AUTO
+
+    # 2. 新增：底部固定按钮区域
+    fixed_bottom_action_bar = ft.Container(
+    content=generate_btn,
+    padding=ft.padding.symmetric(horizontal=0, vertical=10),
+    bgcolor=ft.Colors.TRANSPARENT, # 改为透明
+    border=None, # 移除边框
+)
+
+    # 3. 重组 page1_content (滚动区 + 固定底部)
     page1_content = ft.Container(
         padding=ft.padding.symmetric(horizontal=5, vertical=0),
-        expand=True, content=page1_content_col,
-        on_click=lambda e: close_func_menu() 
+        expand=True,
+        content=ft.Column([
+            # 上方滚动区域 (expand=True 占满剩余空间)
+            ft.Container(
+                content=page1_scroll_col, 
+                expand=True, 
+                padding=ft.padding.only(top=10, bottom=10)
+            ),
+            # 底部固定按钮
+            fixed_bottom_action_bar
+        ], spacing=0, expand=True) 
     )
 
     page2_content = ft.Container(
         padding=ft.padding.symmetric(horizontal=15, vertical=10),
-        expand=True, content=page2_stack,
-        on_click=lambda e: close_func_menu() 
+        expand=True,
+        content=ft.Column([
+            results_grid,  
+        ], expand=True, spacing=0) 
     )
 
     page1_container = ft.Container(content=page1_content, expand=False)
     page2_container = ft.Container(content=page2_content, expand=False)
     
-    # T2I/I2I 的滑动容器
     t2i_slider = ft.Row(
         controls=[page1_container, page2_container],
         spacing=0, alignment="start", vertical_alignment="start", expand=True,
-        offset=utils.MyOffset(0, 0) if utils.MyOffset else None,
-        animate_offset=utils.MyAnimation(300, "easeOut") if utils.MyAnimation else None
+        offset=MyOffset(0, 0) if MyOffset else None,
+        animate_offset=MyAnimation(300, "easeOut") if MyAnimation else None
     )
-    # 【新增】给 Slider 加一个容器，方便整体隐藏
-    t2i_slider_container = ft.Container(content=t2i_slider, expand=True, clip_behavior=ft.ClipBehavior.HARD_EDGE, visible=True)
 
-    # 【新增】历史记录容器
-    history_container = ft.Container(content=history_app.get_content(), expand=True, visible=False, padding=ft.padding.all(0))
-
-    # --- 5.4 底部指示点 ---
-    dot1 = ft.Container(width=10, height=10, border_radius=5, bgcolor=current_primary_color, animate=utils.MyAnimation(200, "easeOut") if utils.MyAnimation else None)
-    dot2 = ft.Container(width=10, height=10, border_radius=5, bgcolor="grey", animate=utils.MyAnimation(200, "easeOut") if utils.MyAnimation else None)
+    dot1 = ft.Container(width=10, height=10, border_radius=5, bgcolor=current_primary_color, animate=MyAnimation(200, "easeOut") if MyAnimation else None)
+    dot2 = ft.Container(width=10, height=10, border_radius=5, bgcolor="grey", animate=MyAnimation(200, "easeOut") if MyAnimation else None)
     dots_row = ft.Row([dot1, dot2], alignment="center", spacing=8)
 
-    # --- 5.5 底部导航栏 ---
-    nav_btn_menu_icon = ft.Icon("menu", size=24, color=current_text_color)
-    nav_btn_menu_text = ft.Text("菜单", size=10, color=current_text_color)
-    nav_btn_func_icon = ft.Icon("palette", size=24, color=current_text_color)
-    nav_btn_func_text = ft.Text("文生图", size=10, color=current_text_color)
-    nav_btn_gallery_icon = ft.Icon("image", size=24, color=current_text_color)
-    nav_btn_gallery_text = ft.Text("结果", size=10, color=current_text_color)
+    # === 底部导航栏相关 (极简静默版) ===
+    
+    nav_btn_menu_icon = ft.Icon("menu", size=24, color="grey")
+    nav_btn_menu_text = ft.Text("菜单", size=10, color="grey")
+    
+    # 【改动】这里不再是固定的“设置”，而是动态的“功能按钮”
+    # 默认初始化为“文生图”，后续可以通过代码修改这两个变量来改变图标和文字
+    nav_btn_func_icon = ft.Icon("palette", size=24, color="grey")
+    nav_btn_func_text = ft.Text("文生图", size=10, color="grey")
+    
+    nav_btn_gallery_icon = ft.Icon("image", size=24, color="grey")
+    nav_btn_gallery_text = ft.Text("图库", size=10, color="grey")
     
     def on_nav_click(index):
-        close_func_menu() 
         toggle_sidebar(False) 
-        # 历史模式下点击导航，先切回 T2I ? 或者保持 History ?
-        # 这里逻辑：点击“结果”或“功能”应当切换回 T2I/I2I 的相应页面
-        # 简单处理：如果是 History 模式，点击左右两侧按钮暂不处理，或者强制切回 T2I
-        if current_app_key == 'history':
-             # 强制切回 T2I
-             switch_app('t2i')
-             if index == 1: # 如果点的是结果
-                 switch_t2i_page(1)
-             return
-
         switch_t2i_page(index)
     
     def on_menu_btn_click(e):
-        close_func_menu()
-        if is_sidebar_open: toggle_sidebar(False)
-        else: toggle_sidebar(True)
+        if mask.visible: 
+            toggle_sidebar(False)
+            switch_t2i_page(0)
+        else:
+            toggle_sidebar(True)
 
     def create_nav_item(icon, text, on_click_func):
         return ft.Container(
-            content=ft.Column([icon, text], spacing=2, alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-            expand=1, alignment=ft.alignment.center, padding=ft.padding.symmetric(vertical=5), bgcolor=ft.Colors.TRANSPARENT, ink=False, on_click=on_click_func
+            content=ft.Column(
+                [icon, text], 
+                spacing=2, 
+                alignment=ft.MainAxisAlignment.CENTER, 
+                horizontal_alignment=ft.CrossAxisAlignment.CENTER
+            ),
+            expand=1, 
+            alignment=ft.alignment.center,
+            padding=ft.padding.symmetric(vertical=5),
+            bgcolor=ft.Colors.TRANSPARENT,
+            ink=False,
+            on_click=on_click_func
         )
 
     nav_item_menu = create_nav_item(nav_btn_menu_icon, nav_btn_menu_text, on_menu_btn_click)
-    
-    nav_item_func_container = ft.Container(
-        content=ft.Column([nav_btn_func_icon, nav_btn_func_text], spacing=2, alignment=ft.MainAxisAlignment.CENTER, horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-        alignment=ft.alignment.center, padding=ft.padding.symmetric(vertical=5), bgcolor=ft.Colors.TRANSPARENT
-    )
-    nav_item_func = ft.GestureDetector(
-        content=nav_item_func_container,
-        expand=1,
-        on_tap=lambda e: on_nav_click(0), 
-        on_long_press_start=lambda e: open_func_menu(e) 
-    )
-
+    # 【改动】中间的按钮现在指向 nav_btn_func_...
+    nav_item_func = create_nav_item(nav_btn_func_icon, nav_btn_func_text, lambda e: on_nav_click(0))
     nav_item_gallery = create_nav_item(nav_btn_gallery_icon, nav_btn_gallery_text, lambda e: on_nav_click(1))
 
     bottom_nav_content = ft.Container(
-        height=56, bgcolor=utils.get_dropdown_bgcolor(current_theme_mode),
-        padding=0, border=ft.border.only(top=ft.BorderSide(0.5, "grey")),
-        content=ft.Row([nav_item_menu, nav_item_func, nav_item_gallery], alignment="start", spacing=0, expand=True),
+        height=56, 
+        bgcolor=get_dropdown_bgcolor(),
+        padding=0, 
+        border=ft.border.only(top=ft.BorderSide(0.5, "grey")),
+        content=ft.Row([
+            nav_item_menu,
+            nav_item_func, # 使用新的功能按钮
+            nav_item_gallery
+        ], 
+        alignment="start",
+        spacing=0, 
+        expand=True
+        ),
     )
 
     bottom_nav_drag_buffer = 0
+
     def on_bottom_nav_pan_update(e: ft.DragUpdateEvent):
         nonlocal bottom_nav_drag_buffer
         bottom_nav_drag_buffer += e.delta_x
 
     def on_bottom_nav_pan_end(e: ft.DragEndEvent):
         nonlocal bottom_nav_drag_buffer
-        if current_app_key == 'history': return # 历史模式禁用滑动导航
-
         velocity = getattr(e, "velocity_x", 0)
-        DIST_THRESHOLD, VELOCITY_THRESHOLD = 50, 800 
+        DIST_THRESHOLD = 50      
+        VELOCITY_THRESHOLD = 800 
+
         if bottom_nav_drag_buffer < -DIST_THRESHOLD or velocity < -VELOCITY_THRESHOLD:
-             if is_sidebar_open: toggle_sidebar(False)
-             elif t2i_page_index == 0: switch_t2i_page(1)
+             if mask.visible: 
+                 toggle_sidebar(False)
+             elif t2i_page_index == 0: 
+                 switch_t2i_page(1)
         elif bottom_nav_drag_buffer > DIST_THRESHOLD or velocity > VELOCITY_THRESHOLD:
-             if t2i_page_index == 1: switch_t2i_page(0)
-             elif t2i_page_index == 0 and not is_sidebar_open: toggle_sidebar(True)
+             if t2i_page_index == 1: 
+                 switch_t2i_page(0)
+             elif t2i_page_index == 0 and not mask.visible: 
+                 toggle_sidebar(True)
         bottom_nav_drag_buffer = 0
 
-    bottom_nav = ft.GestureDetector(content=bottom_nav_content, on_pan_update=on_bottom_nav_pan_update, on_pan_end=on_bottom_nav_pan_end, visible=False)
+    bottom_nav = ft.GestureDetector(
+        content=bottom_nav_content,
+        on_pan_update=on_bottom_nav_pan_update,
+        on_pan_end=on_bottom_nav_pan_end,
+        visible=False
+    )
 
-    # --- 5.6 侧边栏 ---
-    sidebar_icon_ref = ft.Icon("smart_toy", size=40, color=current_text_color)
-    sidebar_title_ref = ft.Text("魔塔AI大全", size=18, weight="bold", color=current_text_color)
-    sidebar_subtitle_ref = ft.Text("By_showevr", size=12, color=current_text_color)
-    sidebar_items_container = ft.Column(spacing=5) 
+    def update_dots():
+        dot1.bgcolor = current_primary_color if t2i_page_index == 0 else "grey"
+        dot2.bgcolor = current_primary_color if t2i_page_index == 1 else "grey"
+        dot1.update()
+        dot2.update()
 
-    def build_sidebar_item(icon_name, text, key, is_selected):
-        color = current_primary_color if is_selected else current_text_color
-        bg = utils.get_opacity_color(0.1, current_primary_color) if is_selected else None
-        nav_highlight_ref = ft.Container(width=4, height=20, border_radius=2, bgcolor=current_primary_color if is_selected else "transparent", animate=utils.MyAnimation(300, "easeOut") if utils.MyAnimation else None)
-        return ft.Container(
-            content=ft.Row([
-                ft.Row([ft.Icon(icon_name, size=20, color=color), ft.Container(width=10), ft.Text(text, size=16, color=color, weight="bold" if is_selected else "normal")]),
-                nav_highlight_ref
-            ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
-            padding=ft.padding.symmetric(horizontal=20, vertical=12), border_radius=30, bgcolor=bg, ink=True, on_click=lambda e: switch_app(key)
-        )
+    def switch_t2i_page(index):
+        nonlocal t2i_page_index
+        t2i_page_index = index
+        
+        if mask.visible:
+            toggle_sidebar(False)
 
-    # 侧边栏底部功能项
-    sidebar_theme_icon = ft.Icon("contrast", color=current_text_color, size=24)
-    sidebar_theme_text = ft.Text("主题设置", color=current_text_color, size=16)
-    sidebar_key_icon = ft.Icon("vpn_key", color=current_text_color, size=24)
-    sidebar_key_text = ft.Text("Api_key", color=current_text_color, size=16)
-    sidebar_power_icon = ft.Icon("flash_on", color=current_text_color, size=24)
-    sidebar_power_text = ft.Text("强力生图模式", color=current_text_color, size=16)
+        if index == 0:
+            # 【改动】选中第一页时，高亮中间的功能按钮
+            nav_btn_func_icon.color = current_primary_color
+            nav_btn_func_text.color = current_primary_color
+            nav_btn_gallery_icon.color = "grey"
+            nav_btn_gallery_text.color = "grey"
+            view_switch_btn.icon = "image"
+            view_switch_btn.tooltip = "查看生成结果"
+        else:
+            # 【改动】选中第二页时，灰显中间的功能按钮
+            nav_btn_func_icon.color = "grey"
+            nav_btn_func_text.color = "grey"
+            nav_btn_gallery_icon.color = current_primary_color
+            nav_btn_gallery_text.color = current_primary_color
+            view_switch_btn.icon = "tune"
+            # 【改动】动态显示返回文本
+            view_switch_btn.tooltip = f"返回{nav_btn_func_text.value}"
+            
+        nav_item_func.update()
+        nav_item_gallery.update()
+        view_switch_btn.update()
+        
+        if is_wide_mode: return 
+        
+        page1_container.visible = (index == 0)
+        page2_container.visible = (index == 1)
+        
+        t2i_slider.offset = None 
+        
+        if not is_wide_mode:
+            gallery_control_gesture.visible = (index == 1)
+            gallery_control_gesture.update()
+
+        page1_container.update()
+        page2_container.update()
+        t2i_slider.update()
+        update_dots()
+
+    def toggle_sidebar(open_it):
+        if MyOffset:
+            sidebar_container.offset = MyOffset(0 if open_it else -1, 0)
+            sidebar_container.update()
+        mask.visible = open_it
+        mask.opacity = 1 if open_it else 0
+        mask.update()
+        
+        nav_btn_menu_icon.color = current_primary_color if open_it else "grey"
+        nav_btn_menu_text.color = current_primary_color if open_it else "grey"
+        nav_btn_menu_icon.update()
+        nav_btn_menu_text.update()
+
+        if not is_wide_mode:
+            if open_it:
+                # 【改动】侧边栏打开时，中间按钮变灰
+                nav_btn_func_icon.color = "grey"
+                nav_btn_func_text.color = "grey"
+                nav_btn_gallery_icon.color = "grey"
+                nav_btn_gallery_text.color = "grey"
+            else:
+                # 【改动】侧边栏关闭时，根据当前页恢复颜色
+                if t2i_page_index == 0:
+                    nav_btn_func_icon.color = current_primary_color
+                    nav_btn_func_text.color = current_primary_color
+                    nav_btn_gallery_icon.color = "grey"
+                    nav_btn_gallery_text.color = "grey"
+                else:
+                    nav_btn_func_icon.color = "grey"
+                    nav_btn_func_text.color = "grey"
+                    nav_btn_gallery_icon.color = current_primary_color
+                    nav_btn_gallery_text.color = current_primary_color
+            
+            nav_item_func.update()
+            nav_item_gallery.update()
+
+
+    mask = ft.Container(
+        bgcolor=get_opacity_color(0.3, "black"),
+        left=0, right=0, top=0, bottom=0, 
+        visible=False, animate_opacity=300, opacity=0,
+        on_click=lambda e: toggle_sidebar(False)
+    )
+
+    # ==========================================
+    #      修改后的设置窗口 (自适应高度版)
+    # ==========================================
+
+    # 1. 上方输入框：取消 expand，改用 min_lines 设定一个舒适的默认高度
+    #    max_lines 设为 25，意味着如果内容超过25行，输入框内部会出现滚动条，防止窗口无限变长
+    api_keys_field = ft.TextField(
+        label="ModelScope Keys (每行一个)", 
+        value=stored_api_keys_str, 
+        multiline=True, 
+        min_lines=10,  # 默认显示高度：10行 (既不空旷，也够用)
+        max_lines=25,  # 最大高度限制：超过自动内部滚动
+        text_size=12, 
+        content_padding=15,
+        border_color=get_border_color() 
+    )
+
+    # 2. 下方输入框：保持原来的紧凑设计
+    baidu_config_field = ft.TextField(
+        label="百度翻译配置 (第一行AppID，第二行密钥)", 
+        value=stored_baidu_config,
+        multiline=True, 
+        text_size=12, 
+        content_padding=10,
+        height=90,    # 固定高度
+        border_color=get_border_color()
+    )
+
+    async def save_settings(e):
+        nonlocal current_api_keys, stored_api_keys_str, stored_baidu_config, current_baidu_appid, current_baidu_key
+        stored_api_keys_str = api_keys_field.value
+        stored_baidu_config = baidu_config_field.value
+        await save_config("api_keys", stored_api_keys_str)
+        await save_config("baidu_config", stored_baidu_config)
+        current_api_keys = [k.strip() for k in stored_api_keys_str.split('\n') if k.strip()]
+        lines = stored_baidu_config.split('\n')
+        current_baidu_appid = lines[0].strip() if len(lines) > 0 else ""
+        current_baidu_key = lines[1].strip() if len(lines) > 1 else ""
+        
+        # 更新Slider
+        key_count = len(current_api_keys)
+        new_max = max(1, key_count)
+        batch_slider.max = new_max
+        if batch_slider.value > new_max: batch_slider.value = new_max 
+        batch_val_text.value = str(int(batch_slider.value)) 
+        
+        batch_slider.update()
+        batch_val_text.update()
+        safe_close_dialog(settings_dialog)
+        page.update()
     
-    sidebar_theme_item = ft.Container(content=ft.Row([sidebar_theme_icon, ft.Container(width=10), sidebar_theme_text]), padding=ft.padding.symmetric(vertical=15, horizontal=20), on_click=lambda e: open_theme_dialog(e), ink=True)
-    sidebar_key_item = ft.Container(content=ft.Row([sidebar_key_icon, ft.Container(width=10), sidebar_key_text]), padding=ft.padding.symmetric(vertical=15, horizontal=20), on_click=lambda e: open_settings_dialog(e), ink=True)
-    sidebar_power_item = ft.Container(content=ft.Row([sidebar_power_icon, ft.Container(width=10), sidebar_power_text]), padding=ft.padding.symmetric(vertical=15, horizontal=20), on_click=lambda e: open_power_mode_dialog(e), ink=True)
+    # 3. 布局容器：使用 Column 并开启 tight=True (关键：紧缩包裹内容)
+    #    scroll=ft.ScrollMode.AUTO 确保如果屏幕实在太小，整个弹窗可以滚动
+    settings_dialog.content = ft.Column(
+        controls=[
+            api_keys_field, 
+            ft.Container(height=15), 
+            baidu_config_field
+        ], 
+        tight=True,  # 【关键】让窗口高度自适应内容，而不是撑满
+        scroll=ft.ScrollMode.AUTO, # 防止小屏幕手机上显示不全
+        width=300,
+        spacing=0
+    )
+    
+    settings_dialog.actions = [ft.TextButton("保存", on_click=save_settings)]
 
-    sidebar_div1 = ft.Divider(height=10, thickness=0.5, color="transparent")
-    sidebar_div2 = ft.Divider(height=10, thickness=0.5, color="transparent")
+    # ================= 5. 主题选择点击逻辑 =================
+    
+    def open_settings_dialog(e):
+        # 【关键修改】删除所有高度计算代码
+        # 直接打开，让 settings_dialog 自己的 tight=True 属性去决定高度
+        safe_open_dialog(settings_dialog)
 
-    sidebar_content = ft.Column([
-            ft.Container(padding=ft.padding.symmetric(horizontal=20), on_click=lambda e: toggle_sidebar(False), content=ft.Row([sidebar_icon_ref, ft.Column([sidebar_title_ref, sidebar_subtitle_ref], spacing=2)])),
-            sidebar_div1, ft.Divider(color="transparent", height=10),
-            ft.Container(padding=ft.padding.symmetric(horizontal=10), content=sidebar_items_container),
-            ft.Container(expand=True), sidebar_div2,
-            ft.Column([sidebar_theme_item, sidebar_power_item, sidebar_key_item], spacing=0)
-        ], expand=True)
+    def build_theme_content():
+        def handle_color_click(name):
+            return lambda e: page.run_task(update_theme, color_name=name)
+
+        def handle_mode_click(mode):
+            return lambda e: page.run_task(update_theme, mode=mode)
+
+        def color_dot(name, hex_c):
+            is_selected = (hex_c == current_primary_color)
+            return ft.Container(
+                width=45, height=45, bgcolor=hex_c, border_radius=22,
+                on_click=handle_color_click(name),
+                border=ft.border.all(3, current_primary_color) if is_selected else None,
+                scale=MyScale(1.1 if is_selected else 1.0) if MyScale else None,
+                animate_scale=MyAnimation(200, "easeOut") if MyAnimation else None
+            )
+        def mode_pill(text, mode_val):
+            is_active = (mode_val == stored_mode)
+            return ft.Container(
+                content=ft.Text(text, color=current_primary_color if is_active else "grey", size=14),
+                padding=ft.padding.symmetric(horizontal=18, vertical=8),
+                border=ft.border.all(1.5, current_primary_color if is_active else "grey"),
+                border_radius=20,
+                bgcolor=get_opacity_color(0.1, current_primary_color) if is_active else None,
+                on_click=handle_mode_click(mode_val)
+            )
+        return ft.Column([
+            ft.Text("莫兰迪色系", size=13, color="grey"),
+            ft.Divider(height=10, color="transparent"), 
+            ft.Row([color_dot(n, h) for n, h in list(MORANDI_COLORS.items())[:4]], spacing=12, alignment="start"),
+            ft.Container(height=8),
+            ft.Row([color_dot(n, h) for n, h in list(MORANDI_COLORS.items())[4:]], spacing=12, alignment="start"),
+            ft.Divider(height=30, thickness=0.5, color=get_opacity_color(0.2, "grey")), 
+            ft.Text("主题模式", size=13, color="grey"),
+            ft.Divider(height=10, color="transparent"),
+            ft.Row([mode_pill("护眼", "warm"), mode_pill("浅色", "light"), mode_pill("深色", "dark")], alignment="start", spacing=10)
+        ], spacing=0, horizontal_alignment="start", tight=True)
+
+    sidebar_theme_icon = ft.Icon("contrast", color="grey", size=24)
+    sidebar_theme_text = ft.Text("主题设置", color="grey", size=16)
+    sidebar_key_icon = ft.Icon("vpn_key", color="grey", size=24)
+    sidebar_key_text = ft.Text("Api_key", color="grey", size=16)
+
+    async def update_theme(mode=None, color_name=None):
+        nonlocal current_primary_color, stored_mode
+        if color_name:
+            hex_val = MORANDI_COLORS[color_name]
+            current_primary_color = hex_val
+            page.theme = ft.Theme(
+                color_scheme_seed=hex_val,
+                dialog_theme=ft.DialogTheme(surface_tint_color=ft.Colors.TRANSPARENT),
+                slider_theme=ft.SliderTheme(
+                    active_tick_mark_color=ft.Colors.TRANSPARENT,
+                    inactive_tick_mark_color=ft.Colors.TRANSPARENT
+                )
+            )
+            
+            await save_config("theme_color", color_name)
+            generate_btn.bgcolor = hex_val
+            
+            nav_text_ref.color = hex_val
+            nav_icon_ref.color = hex_val 
+            nav_highlight_ref.bgcolor = hex_val
+            
+            sidebar_theme_icon.color = "grey" 
+            
+            batch_slider.active_color = hex_val
+            steps_slider.active_color = hex_val
+            guidance_slider.active_color = hex_val
+            custom_model_btn.color = hex_val
+            custom_size_btn.color = hex_val
+            
+            sidebar_div1.color = get_opacity_color(0.2, hex_val)
+            sidebar_div2.color = get_opacity_color(0.2, hex_val)
+            sidebar_div1.update()
+            sidebar_div2.update()
+
+            update_dots()
+            switch_t2i_page(t2i_page_index)
+
+            # 更新缩略图卡片颜色
+            for card in results_grid.controls:
+                try:
+                    stack = card.content
+                    
+                    # --- 🎨 新增：更新 Loading 区域颜色 ---
+                    # 以前这里直接获取 status_text，现在这里是一个包含 Ring 和 Text 的 Column
+                    loading_bg_container = stack.controls[0] 
+                    
+                    # 检查是否为新结构 (Column)
+                    if isinstance(loading_bg_container.content, ft.Column):
+                        loading_col = loading_bg_container.content
+                        # loading_col.controls[0] 是 ProgressRing
+                        # loading_col.controls[2] 是 Text
+                        loading_col.controls[0].color = hex_val 
+                        loading_col.controls[2].color = hex_val
+                    # -----------------------------------
+                    
+                    meta_overlay = stack.controls[2]
+                    meta_col = meta_overlay.content
+                    meta_col.controls[0].controls[0].color = hex_val
+                    meta_col.controls[0].controls[1].icon_color = hex_val
+                    meta_col.controls[1].color = hex_val
+                    meta_col.controls[2].color = hex_val
+                    meta_col.controls[3].controls[0].color = hex_val
+                    meta_col.controls[3].controls[1].icon_color = hex_val
+                    meta_col.controls[4].color = hex_val
+
+                    action_bar_container = stack.controls[3]
+                    action_bar_row = action_bar_container.content 
+                    for btn in action_bar_row.controls:
+                         btn.icon_color = hex_val
+                         if btn.icon == "check_circle": 
+                             btn.icon_color = hex_val
+                except Exception as e: 
+                    pass
+            
+            results_grid.update()
+
+            # 更新查看器按钮颜色
+            for btn in viewer_control_btns:
+                btn.icon_color = hex_val
+                try: btn.update()
+                except: pass
+            
+            prev_btn.icon_color = hex_val
+            try: prev_btn.update()
+            except: pass
+            
+            next_btn.icon_color = hex_val
+            try: next_btn.update()
+            except: pass
+            
+            viewer_info_prompt.color = hex_val
+            viewer_info_neg.color = hex_val
+            viewer_title_prompt.color = hex_val
+            viewer_title_neg.color = hex_val
+            viewer_copy_prompt_btn.icon_color = hex_val
+            viewer_copy_neg_btn.icon_color = hex_val
+
+            try: viewer_info_container.update()
+            except: pass
+            
+            # 更新下载按钮颜色
+            viewer_dl_btn.icon_color = hex_val
+            btn_browser_dl.icon_color = hex_val
+            try: viewer_dl_btn.update()
+            except: pass
+            try: btn_browser_dl.update()
+            except: pass  # 补全这个 except
+            
+            # 更新提示胶囊颜色
+            zoom_hint_container.bgcolor = get_opacity_color(0.7, hex_val)
+            try: zoom_hint_container.update()
+            except: pass
+
+        if mode:
+            stored_mode = mode 
+            await save_config("theme_mode", mode)
+            fill = get_dropdown_bgcolor()
+            
+            fixed_bottom_action_bar.bgcolor = ft.Colors.TRANSPARENT
+            
+            model_dropdown.fill_color = fill
+            model_dropdown.bgcolor = get_dropdown_fill_color() 
+            size_dropdown.fill_color = fill
+            size_dropdown.bgcolor = get_dropdown_fill_color()
+            border_c = get_border_color()
+            model_search_field.border_color = border_c
+            model_dropdown_container.border = ft.border.all(1, border_c) 
+            size_dropdown_container.border = ft.border.all(1, border_c)
+            custom_model_btn.style.side = ft.BorderSide(1, border_c)
+            custom_size_btn.style.side = ft.BorderSide(1, border_c)
+            seed_input.border_color = border_c
+            prompt_container.border = ft.border.all(1, border_c)
+            neg_prompt_container.border = ft.border.all(1, border_c)
+            
+            if mode == "dark":
+                viewer_bg = BG_DARK 
+                sidebar_bg = BG_DARK_DIALOG 
+                nav_bg_selected = "#333333" 
+                dialog_bg = BG_DARK_DIALOG
+                text_color = "white"
+                try: page.theme_mode = ft.ThemeMode.DARK
+                except: page.theme_mode = "dark"
+                page.bgcolor = BG_DARK
+                main_content_bg.bgcolor = BG_DARK
+                sidebar_container.bgcolor = sidebar_bg
+            elif mode == "warm":
+                viewer_bg = BG_WARM 
+                sidebar_bg = "#F5F0EB" 
+                nav_bg_selected = "#EBE6E1" 
+                dialog_bg = BG_WARM
+                text_color = "#333333"
+                try: page.theme_mode = ft.ThemeMode.LIGHT
+                except: page.theme_mode = "light"
+                page.bgcolor = BG_WARM
+                main_content_bg.bgcolor = BG_WARM
+                sidebar_container.bgcolor = sidebar_bg
+            else: 
+                viewer_bg = BG_LIGHT 
+                sidebar_bg = "white" 
+                nav_bg_selected = "#F0F0F0" 
+                dialog_bg = "white"
+                text_color = "#333333"
+                try: page.theme_mode = ft.ThemeMode.LIGHT
+                except: page.theme_mode = "light"
+                page.bgcolor = BG_LIGHT
+                main_content_bg.bgcolor = BG_LIGHT
+                sidebar_container.bgcolor = "white"
+
+            nav_container_ref.bgcolor = nav_bg_selected
+            
+            theme_dialog.bgcolor = dialog_bg
+            settings_dialog.bgcolor = dialog_bg
+            custom_model_dialog.bgcolor = dialog_bg
+            custom_size_dialog.bgcolor = dialog_bg
+            gallery_popup_menu.bgcolor = dialog_bg 
+
+            bottom_nav_content.bgcolor = sidebar_bg
+            
+            if viewer_overlay.visible:
+                viewer_overlay.bgcolor = viewer_bg
+                viewer_background_container.bgcolor = viewer_bg
+                update_viewer_layout_content() 
+
+        if theme_dialog.open:
+            theme_dialog.content = ft.Container(content=build_theme_content(), width=300, padding=ft.padding.only(top=10, left=10, right=10))
+            theme_dialog.update()
+            
+        page.update()
+
+    def open_theme_dialog(e):
+        theme_dialog.content = ft.Container(content=build_theme_content(), width=300, padding=ft.padding.only(top=10, left=10, right=10))
+        theme_dialog.actions = [ft.TextButton("确定", on_click=lambda e: safe_close_dialog(theme_dialog))]
+        safe_open_dialog(theme_dialog)
+
+    sidebar_theme_item = ft.Container(
+        content=ft.Row([sidebar_theme_icon, ft.Container(width=10), sidebar_theme_text]),
+        padding=ft.padding.symmetric(vertical=15, horizontal=20),
+        on_click=open_theme_dialog,
+        ink=True
+    )
+    
+    sidebar_key_item = ft.Container(
+        content=ft.Row([sidebar_key_icon, ft.Container(width=10), sidebar_key_text]),
+        padding=ft.padding.symmetric(vertical=15, horizontal=20),
+        on_click=open_settings_dialog,
+        ink=True
+    )
 
     sidebar_drag_buffer = 0
+
     def on_sidebar_pan_update(e: ft.DragUpdateEvent):
         nonlocal sidebar_drag_buffer
         sidebar_drag_buffer += e.delta_x
+
     def on_sidebar_pan_end(e: ft.DragEndEvent):
         nonlocal sidebar_drag_buffer
         velocity = getattr(e, "velocity_x", 0)
-        if sidebar_drag_buffer < -50 or velocity < -800: toggle_sidebar(False)
+        
+        if sidebar_drag_buffer < -50 or velocity < -800:
+            toggle_sidebar(False)
+        
         sidebar_drag_buffer = 0
 
-    sidebar_gesture_detector = ft.GestureDetector(content=sidebar_content, on_pan_update=on_sidebar_pan_update, on_pan_end=on_sidebar_pan_end)
-    sidebar_container = ft.Container(
-        width=250, top=0, bottom=0, bgcolor="white", padding=ft.padding.only(top=50, bottom=20), 
-        offset=utils.MyOffset(-1, 0) if utils.MyOffset else None,
-        animate_offset=utils.MyAnimation(300, "easeOut") if utils.MyAnimation else None,
-        content=sidebar_gesture_detector, shadow=ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.2, "black"))
+    sidebar_content = ft.Column([
+            ft.Container(padding=ft.padding.symmetric(horizontal=20), on_click=lambda e: toggle_sidebar(False), content=ft.Row([sidebar_icon_ref, ft.Column([sidebar_title_ref, sidebar_subtitle_ref], spacing=2)])),
+            sidebar_div1,
+            ft.Divider(color="transparent", height=10),
+            ft.Container(padding=ft.padding.symmetric(horizontal=10), content=nav_container_ref),
+            ft.Container(expand=True),
+            sidebar_div2,
+            ft.Column([
+                sidebar_theme_item,
+                sidebar_key_item
+            ], spacing=0)
+        ], expand=True)
+
+    sidebar_gesture_detector = ft.GestureDetector(
+        content=sidebar_content,
+        on_pan_update=on_sidebar_pan_update, 
+        on_pan_end=on_sidebar_pan_end        
     )
 
-    # --- 5.7 顶部 App Bar ---
+    sidebar_container = ft.Container(
+        width=200, top=0, bottom=0, bgcolor="white",
+        padding=ft.padding.only(top=50, bottom=20), offset=sidebar_offset,
+        animate_offset=MyAnimation(300, "easeOut") if MyAnimation else None,
+        content=sidebar_gesture_detector 
+    )
+
     def toggle_left_panel(e):
         nonlocal left_panel_visible
         left_panel_visible = not left_panel_visible
@@ -463,158 +2642,170 @@ async def main(page: ft.Page):
         on_resize(None)
         custom_appbar.update()
 
-    top_menu_btn = ft.IconButton("menu", icon_size=24, on_click=lambda e: toggle_sidebar(True))
     toggle_panel_btn = ft.IconButton("keyboard_double_arrow_left", tooltip="折叠参数栏", on_click=toggle_left_panel, visible=False)
-    view_switch_btn = ft.IconButton(icon="image", tooltip="查看生成结果", visible=False, on_click=lambda e: switch_t2i_page(1 if t2i_page_index == 0 else 0))
-
-    custom_appbar = ft.Container(
-        height=50, padding=ft.padding.only(left=10, right=10),
-        content=ft.Row([top_menu_btn, toggle_panel_btn, ft.Container(expand=True), view_switch_btn], alignment="start")
+    
+    top_menu_btn = ft.IconButton("menu", icon_size=24, on_click=lambda e: toggle_sidebar(True))
+    
+    view_switch_btn = ft.IconButton(
+        icon="image", tooltip="查看生成结果", visible=False,
+        on_click=lambda e: switch_t2i_page(1 if t2i_page_index == 0 else 0)
     )
 
-    # --- 5.8 图库控制 ---
     def set_gallery_columns(cols):
-        # 根据不同模块调用不同的 grid 设置
-        if current_app_key == 't2i':
-            t2i_app.set_grid_columns(cols)
-        elif current_app_key == 'i2i':
-            i2i_app.set_grid_columns(cols)
-        elif current_app_key == 'history':
-            history_app.set_grid_columns(cols)
+        results_grid.runs_count = cols
+        results_grid.max_extent = None 
+        results_grid.update()
 
     gallery_popup_menu = ft.PopupMenuButton(
-        icon="circle_outlined", icon_size=30, tooltip="调整图库布局", surface_tint_color=ft.Colors.TRANSPARENT, 
+        icon="circle_outlined",
+        icon_size=30,
+        tooltip="调整图库布局",
+        surface_tint_color=ft.Colors.TRANSPARENT, 
         items=[
             ft.PopupMenuItem(text="1列 (大图)", on_click=lambda e: set_gallery_columns(1)),
-            ft.PopupMenuItem(text="2列 (标准)", on_click=lambda e: set_gallery_columns(2)),
-            ft.PopupMenuItem(text="3列 (小图)", on_click=lambda e: set_gallery_columns(3)),
-            ft.PopupMenuItem(text="4列 (超小)", on_click=lambda e: set_gallery_columns(4)),
+            ft.PopupMenuItem(text="2列", on_click=lambda e: set_gallery_columns(2)),
+            ft.PopupMenuItem(text="3列", on_click=lambda e: set_gallery_columns(3)),
+            ft.PopupMenuItem(text="4列 (小图)", on_click=lambda e: set_gallery_columns(4)),
         ]
     )
+    
+    gallery_simple_icon = ft.Icon(name="circle_outlined", size=30, color=current_primary_color)
 
+    gallery_control_btn_container = ft.Container(
+        content=None,
+        bgcolor="transparent", 
+    )
+    
+    def update_gallery_controller_content():
+        gallery_control_btn_container.content = gallery_popup_menu
+    
     def on_gallery_btn_pan(e: ft.DragUpdateEvent):
+        # 1. 基础宽高获取 (强制转 float)
         safe_w = float(page.width) if page.width else 360.0
-        curr_left = float(gallery_control_gesture.left) if gallery_control_gesture.left not in [None, ""] else (safe_w - 60)
-        curr_bottom = float(gallery_control_gesture.bottom) if gallery_control_gesture.bottom not in [None, ""] else 100.0
-        gallery_control_gesture.right = None 
-        gallery_control_gesture.left = curr_left + e.delta_x
-        gallery_control_gesture.bottom = curr_bottom - e.delta_y
+        safe_h = float(page.height) if page.height else 640.0
+
+        # 2. 计算左侧边界
+        sidebar_w = 0
+        if is_wide_mode:
+             sidebar_w = 300 
+             if safe_w * 0.5 > 300: sidebar_w = safe_w * 0.5 
+             else: sidebar_w = 300
+        
+        min_left = sidebar_w + 10 
+        max_left = safe_w - 60    
+
+        # ==========================================
+        #      【核心修复】更强壮的类型转换逻辑
+        # ==========================================
+        
+        # --- 处理 Left (横向) ---
+        raw_left = gallery_control_gesture.left
+        # 如果是 None 或者 空字符串，说明还没拖动过，还在默认位置(右侧)
+        if raw_left is None or raw_left == "":
+            current_left = float(max_left - 20) 
+            gallery_control_gesture.right = None # 开始拖动后，清除 right 定位，改为 left 定位
+        else:
+            try:
+                current_left = float(raw_left)
+            except ValueError:
+                #以此防止万一出现的其他奇怪字符
+                current_left = float(max_left - 20)
+
+        # --- 处理 Bottom (纵向) ---
+        raw_bottom = gallery_control_gesture.bottom
+        if raw_bottom is None or raw_bottom == "":
+            current_bottom = 100.0
+        else:
+            try:
+                current_bottom = float(raw_bottom)
+            except ValueError:
+                current_bottom = 100.0
+
+        # 3. 计算新坐标
+        new_left = current_left + e.delta_x
+        new_bottom = current_bottom - e.delta_y 
+
+        # 4. 边界限制
+        if new_left < min_left: new_left = min_left
+        if new_left > max_left: new_left = max_left
+
+        min_bottom = 20
+        max_bottom = safe_h - 120 
+        
+        if new_bottom < min_bottom: new_bottom = min_bottom
+        if new_bottom > max_bottom: new_bottom = max_bottom
+
+        # 5. 更新位置
+        gallery_control_gesture.left = new_left
+        gallery_control_gesture.bottom = new_bottom
         gallery_control_gesture.update()
 
-    gallery_control_gesture = ft.GestureDetector(content=ft.Container(content=gallery_popup_menu, bgcolor="transparent"), on_pan_update=on_gallery_btn_pan, right=20, left=None, bottom=100, visible=False)
+    gallery_control_gesture = ft.GestureDetector(
+        content=gallery_control_btn_container,
+        on_pan_update=on_gallery_btn_pan,
+        right=20,   
+        left=None,  
+        bottom=100, 
+        visible=False 
+    )
 
-    # ================= 6. 核心逻辑实现 =================
-
-    def switch_t2i_page(index):
-        nonlocal t2i_page_index
-        t2i_page_index = index
-        if is_sidebar_open: toggle_sidebar(False)
-
-        if index == 0:
-            nav_btn_func_icon.color = current_primary_color
-            nav_btn_func_text.color = current_primary_color
-            nav_btn_gallery_icon.color = current_text_color
-            nav_btn_gallery_text.color = current_text_color
-            view_switch_btn.icon = "image"
-            view_switch_btn.tooltip = "查看结果"
-        else:
-            nav_btn_func_icon.color = current_text_color
-            nav_btn_func_text.color = current_text_color
-            nav_btn_gallery_icon.color = current_primary_color
-            nav_btn_gallery_text.color = current_primary_color
-            view_switch_btn.icon = "tune"
-            view_switch_btn.tooltip = f"返回{nav_btn_func_text.value}"
-            
-        nav_item_func.content.update() 
-        nav_item_gallery.update()
-        view_switch_btn.update()
-        
-        update_gallery_btn_visibility()
-        
-        if is_wide_mode: return 
-        
-        # 仅在非历史模式下处理分页
-        if current_app_key != 'history':
-            page1_container.visible = (index == 0)
-            page2_container.visible = (index == 1)
-            t2i_slider.offset = None 
-            page1_container.update()
-            page2_container.update()
-            t2i_slider.update()
-            update_dots()
-
-    def update_dots():
-        dot1.bgcolor = current_primary_color if t2i_page_index == 0 else "grey"
-        dot2.bgcolor = current_primary_color if t2i_page_index == 1 else "grey"
-        dot1.update()
-        dot2.update()
-
-    def toggle_sidebar(open_it):
-        nonlocal is_sidebar_open
-        is_sidebar_open = open_it
-        if utils.MyOffset:
-            sidebar_container.offset = utils.MyOffset(0 if open_it else -1, 0)
-            sidebar_container.update()
-        
-        if not is_wide_mode:
-            mask.visible = open_it
-            mask.opacity = 1 if open_it else 0
-            mask.update()
-        else:
-            mask.visible = False
-            mask.update()
-        
-        nav_btn_menu_icon.color = current_primary_color if open_it else current_text_color
-        nav_btn_menu_text.color = current_primary_color if open_it else current_text_color
-        nav_btn_menu_icon.update()
-        nav_btn_menu_text.update()
-
-        if not is_wide_mode and current_app_key != 'history':
-            if open_it:
-                nav_btn_func_icon.color = current_text_color
-                nav_btn_func_text.color = current_text_color
-                nav_btn_gallery_icon.color = current_text_color
-                nav_btn_gallery_text.color = current_text_color
-            else:
-                if t2i_page_index == 0:
-                    nav_btn_func_icon.color = current_primary_color
-                    nav_btn_func_text.color = current_primary_color
-                else:
-                    nav_btn_gallery_icon.color = current_primary_color
-                    nav_btn_gallery_text.color = current_primary_color
-            nav_item_func.content.update()
-            nav_item_gallery.update()
-            
-        update_gallery_btn_visibility()
-
+    # ==========================================
+    #      【核心逻辑】响应式布局调整
+    # ==========================================
     def on_resize(e):
         nonlocal is_wide_mode
-        pw = page.width if page.width else 0
-        ph = page.height if page.height else 0
-        if pw == 0 or ph == 0: return
+        # 给一个默认值（例如 390x844），确保即使 page.width 还没准备好，也能按手机模式渲染
+        pw = page.width if page.width else 390 
+        ph = page.height if page.height else 844
+
+        # 删除 if pw == 0 return 这一句，强制执行后续布局逻辑
 
         new_is_wide = (pw > ph and pw > 600)
+        mode_changed = (new_is_wide != is_wide_mode)
         is_wide_mode = new_is_wide
 
-        # 调用各模块的 Resize
-        t2i_app.on_resize(is_wide_mode, pw, ph)
-        i2i_app.on_resize(is_wide_mode, pw, ph)
-        history_app.on_resize(is_wide_mode, pw, ph)
-        image_viewer.on_resize(is_wide_mode, pw, ph)
-
-        if is_wide_mode: close_func_menu()
-
+        for card in results_grid.controls:
+            try:
+                stack = card.content
+                action_row = stack.controls[3].content 
+                btn_browser = action_row.controls[1]
+                btn_dl = action_row.controls[2]
+                
+                img_obj = stack.controls[1].content
+                if img_obj.src:
+                    if is_wide_mode:
+                        btn_dl.visible = True
+                        btn_browser.visible = False
+                    else:
+                        btn_dl.visible = False
+                        btn_browser.visible = True
+                    btn_dl.update()
+                    btn_browser.update()
+            except: pass
+        
         if is_wide_mode:
-            t2i_slider.offset = utils.MyOffset(0, 0)
+            viewer_dl_btn.visible = True
+            btn_browser_dl.visible = False
+        else:
+            viewer_dl_btn.visible = False
+            btn_browser_dl.visible = True
+        
+        if viewer_overlay.visible:
+            try: viewer_dl_btn.update()
+            except: pass
+            try: btn_browser_dl.update()
+            except: pass
+
+        # -----------------------------------------------
+        # 常规布局调整
+        # -----------------------------------------------
+        if is_wide_mode:
+            t2i_slider.offset = MyOffset(0, 0)
+            
             sidebar_container.width = pw * 0.5 if pw * 0.5 < 300 else 300 
             sidebar_container.bottom = 0
-            if utils.MyOffset: sidebar_container.offset = utils.MyOffset(0 if is_sidebar_open else -1, 0)
-            
             mask.bottom = 0
-            mask.visible = False
             
-            # 宽屏模式下对 Slider 内部容器的处理
-            # 如果是历史模式，slider 本身就是隐藏的，所以这些逻辑不会影响视觉
             if left_panel_visible:
                 page1_container.visible = True
                 page1_container.width = None
@@ -634,319 +2825,157 @@ async def main(page: ft.Page):
             view_switch_btn.visible = False
             top_menu_btn.visible = True
             bottom_nav.visible = False 
+            
+            results_grid.max_extent = 300
+            results_grid.runs_count = None 
+            
+            # 【关键修改】无论宽屏还是竖屏，都允许自动滚动
+            page1_scroll_col.scroll = ft.ScrollMode.AUTO 
+            
             custom_appbar.height = 50
-            if current_app_key != 'history':
-                fixed_bottom_action_bar.visible = True
-            sidebar_container.shadow = None
+            fixed_bottom_action_bar.visible = True
 
         else: 
             t2i_slider.offset = None 
-            sidebar_container.width = pw 
-            sidebar_container.bottom = 0 
-            if utils.MyOffset: sidebar_container.offset = utils.MyOffset(0 if is_sidebar_open else -1, 0)
             
-            mask.visible = is_sidebar_open
-            mask.opacity = 1 if is_sidebar_open else 0
+            sidebar_container.width = pw 
+            sidebar_container.bottom = 56
+            mask.bottom = 56
             
             top_menu_btn.visible = False 
             view_switch_btn.visible = False
             toggle_panel_btn.visible = False
             bottom_nav.visible = True 
+
             custom_appbar.height = 1 
             
             page1_container.visible = (t2i_page_index == 0)
             page1_container.expand = True 
             page1_container.width = pw
             page1_container.height = None 
+            
             page2_container.visible = (t2i_page_index == 1)
             page2_container.expand = True
             page2_container.width = pw
             page2_container.height = None
             
             dots_row.visible = False 
-            if current_app_key != 'history':
-                fixed_bottom_action_bar.visible = True
-            sidebar_container.shadow = ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.2, "black"))
+            
+            results_grid.max_extent = 160
+            results_grid.runs_count = None 
+            
+            # 【关键修改】保持自动滚动
+            page1_scroll_col.scroll = ft.ScrollMode.AUTO 
+            
+            fixed_bottom_action_bar.visible = True
 
-        # 使用统一函数更新
-        update_gallery_btn_visibility()
-        page.update()
+        update_gallery_controller_content()
 
+        current_safe_w = pw
+        sidebar_edge = 0
+        if is_wide_mode:
+            sidebar_edge = 300 if pw * 0.5 < 300 else pw * 0.5
+
+        btn_left = gallery_control_gesture.left
+
+        need_reset = False
+        if btn_left is not None:
+            if btn_left < sidebar_edge: need_reset = True 
+            if btn_left > current_safe_w - 50: need_reset = True 
+        
+        if mode_changed or need_reset:
+            gallery_control_gesture.left = None 
+            gallery_control_gesture.right = 20  
+            gallery_control_gesture.bottom = 100 
+            gallery_control_gesture.update()
+
+        if is_wide_mode:
+            gallery_control_gesture.visible = True
+        else:
+            gallery_control_gesture.visible = (t2i_page_index == 1) and (not viewer_overlay.visible)
+        
+        page1_container.update()
+        page2_container.update()
+        t2i_slider.update()
+        dots_row.update()
+        sidebar_container.update()
+        toggle_panel_btn.update()
+        view_switch_btn.update()
+        top_menu_btn.update()
+        bottom_nav.update()
+        mask.update()
+        prompt_input.update()
+        custom_appbar.update()
+        gallery_control_gesture.update()
+        
+        if viewer_overlay.visible:
+            update_viewer_layout_content()
+        
     page.on_resize = on_resize
 
-    # ================= 7. 设置与主题窗口 =================
-    
-    settings_dialog = ft.AlertDialog(title=ft.Text("全局设置", size=14), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
-    theme_dialog = ft.AlertDialog(title=ft.Text("显示与主题", weight="bold", size=14), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
-    power_mode_dialog = ft.AlertDialog(title=ft.Row([ft.Icon("flash_on", color="amber"), ft.Text("强力生图模式", weight="bold", size=14)]), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
+    custom_appbar = ft.Container(
+        height=50, padding=ft.padding.only(left=10, right=10),
+        content=ft.Row([
+            top_menu_btn,
+            toggle_panel_btn,
+            ft.Container(expand=True),
+            view_switch_btn 
+        ], alignment="start")
+    )
 
-    api_keys_field = ft.TextField(label="ModelScope Keys (每行一个)", value="\n".join(current_api_keys), multiline=True, min_lines=10, max_lines=25, text_size=12, content_padding=15, border_color=utils.get_border_color(current_theme_mode))
-    baidu_config_field = ft.TextField(label="百度翻译配置 (第一行AppID，第二行密钥)", value=f"{current_baidu_config.get('appid','')}\n{current_baidu_config.get('key','')}", multiline=True, text_size=12, content_padding=10, height=90, border_color=utils.get_border_color(current_theme_mode))
-
-    async def save_settings(e):
-        nonlocal current_api_keys, current_baidu_config
-        await utils.save_config_to_storage(page, "api_keys", api_keys_field.value)
-        await utils.save_config_to_storage(page, "baidu_config", baidu_config_field.value)
-        new_config = await utils.load_global_config(page)
-        current_api_keys = new_config["api_keys"]
-        current_baidu_config = new_config["baidu_config"]
-        t2i_app.update_config(new_config)
-        i2i_app.update_config(new_config)
-        utils.safe_close_dialog(page, settings_dialog)
-        page.snack_bar = ft.SnackBar(ft.Text("设置已保存"), open=True)
-        page.update()
-
-    def open_settings_dialog(e):
-        api_keys_field.value = "\n".join(current_api_keys)
-        baidu_config_field.value = f"{current_baidu_config.get('appid','')}\n{current_baidu_config.get('key','')}"
-        settings_dialog.content = ft.Column([api_keys_field, ft.Container(height=15), baidu_config_field], tight=True, scroll=ft.ScrollMode.AUTO, width=300, spacing=0)
-        settings_dialog.actions = [ft.TextButton("保存", on_click=save_settings)]
-        utils.safe_open_dialog(page, settings_dialog)
-
-    # ------------------ 强力模式相关逻辑 ------------------
-    pm_enabled_switch = ft.Switch(label="启用强力生图", value=False, active_color="amber")
-    pm_batch_slider = ft.Slider(min=1, max=50, divisions=49, label="{value}", value=10, active_color="amber")
-    pm_delay_slider = ft.Slider(min=0.1, max=3.0, divisions=29, label="{value}秒", value=0.2, active_color="amber")
-    pm_keys_container = ft.Column([], spacing=2)
-    pm_limit_field = ft.TextField(label="每日API Key可调用的次数", value="200", keyboard_type="number", text_size=12, height=40, content_padding=10)
-
-    async def save_power_mode_settings(e=None):
-        nonlocal current_power_config
-        selected_keys_list = []
-        for chk in pm_keys_container.controls:
-            if isinstance(chk, ft.Checkbox) and chk.value:
-                if chk.data: selected_keys_list.append(chk.data.strip())
-        
-        try: daily_limit = int(pm_limit_field.value)
-        except: daily_limit = 200
-
-        new_power_config = {
-            "enabled": pm_enabled_switch.value,
-            "batch_size": int(pm_batch_slider.value),
-            "selected_keys": selected_keys_list,
-            "daily_limit": daily_limit,
-            "request_delay": float(pm_delay_slider.value)
-        }
-        
-        await utils.save_config_to_storage(page, "power_mode_config", new_power_config)
-        config["power_mode_config"] = new_power_config
-        current_power_config = new_power_config
-        t2i_app.update_config(config)
-        i2i_app.update_config(config)
-        utils.safe_close_dialog(page, power_mode_dialog)
-        page.snack_bar = ft.SnackBar(ft.Text("强力模式配置已保存"), open=True)
-        page.update()
-
-    async def _init_power_mode_ui():
-        pm_enabled_switch.value = current_power_config.get("enabled", False)
-        pm_batch_slider.value = float(current_power_config.get("batch_size", 10))
-        pm_delay_slider.value = float(current_power_config.get("request_delay", 0.2))
-        pm_limit_field.value = str(current_power_config.get("daily_limit", 200))
-        saved_selected = [k.strip() for k in current_power_config.get("selected_keys", []) if k]
-        
-        controls_list = []
-        limit_val = int(current_power_config.get("daily_limit", 200))
-        
-        if not current_api_keys:
-            controls_list.append(ft.Text("请先在 API Key 设置中添加 Key", color="red", size=12))
-        else:
-            for idx, raw_k in enumerate(current_api_keys):
-                k = raw_k.strip() 
-                if not k: continue
-                usage = await utils.get_api_usage(page, k)
-                remaining = max(0, limit_val - usage)
-                is_checked = False
-                if not saved_selected: is_checked = True 
-                else: is_checked = (k in saved_selected)
-                chk = ft.Checkbox(label=f"Key {idx+1} (剩余:{remaining})", value=is_checked, data=k)
-                controls_list.append(chk)
-        
-        pm_keys_container.controls = controls_list
-        power_mode_dialog.content.update()
-
-    def open_power_mode_dialog(e):
-        power_mode_dialog.content = ft.Container(
-            width=320,
-            content=ft.Column([
-                ft.Container(height=10),
-                pm_enabled_switch,
-                ft.Container(height=10),
-                ft.Text("您一次想生成的图片数量:", size=12),
-                pm_batch_slider,
-                ft.Container(height=5),
-                ft.Text("任务创建间隔 (防止QPS超限):", size=12),
-                pm_delay_slider,
-                ft.Divider(height=20, thickness=0.5),
-                ft.Text("配置 API Key:", size=12),
-                ft.Container(
-                    content=pm_keys_container,
-                    height=150, 
-                    border=ft.border.all(1, utils.get_border_color(current_theme_mode)),
-                    border_radius=5,
-                    padding=10,
-                ), 
-                ft.Container(height=10),
-                pm_limit_field,
-                ft.Text("提示: 此限制仅用于本地统计显示，不代表官方实际限制。", size=10, color="grey")
-            ], tight=True, scroll=ft.ScrollMode.AUTO)
-        )
-        pm_keys_container.scroll = ft.ScrollMode.AUTO
-        power_mode_dialog.actions = [
-            ft.TextButton("取消", on_click=lambda e: utils.safe_close_dialog(page, power_mode_dialog)),
-            ft.ElevatedButton("保存", on_click=lambda e: page.run_task(save_power_mode_settings), bgcolor="amber", color="black")
-        ]
-        utils.safe_open_dialog(page, power_mode_dialog)
-        page.run_task(_init_power_mode_ui)
-
-    # ----------------------------------------------------
-
-    async def update_global_theme(mode=None, color_name=None):
-        nonlocal current_primary_color, current_theme_mode, current_text_color
-        
-        if color_name:
-            current_theme_color_name = color_name
-            current_primary_color = utils.MORANDI_COLORS[color_name]
-            await utils.save_config_to_storage(page, "theme_color", color_name)
-            page.theme = ft.Theme(color_scheme_seed=current_primary_color, dialog_theme=ft.DialogTheme(surface_tint_color=ft.Colors.TRANSPARENT))
-            switch_app(current_app_key) 
-            sidebar_theme_icon.color = "grey"
-            update_dots()
-            gallery_popup_menu.icon_color = current_primary_color
-
-        if mode:
-            current_theme_mode = mode
-            await utils.save_config_to_storage(page, "theme_mode", mode)
-            current_text_color = utils.get_text_color(mode)
-            
-            sidebar_icon_ref.color = current_text_color
-            sidebar_title_ref.color = current_text_color
-            sidebar_subtitle_ref.color = current_text_color
-            
-            for icon in [sidebar_theme_icon, sidebar_key_icon, sidebar_power_icon]:
-                icon.color = current_text_color
-            for txt in [sidebar_theme_text, sidebar_key_text, sidebar_power_text]:
-                txt.color = current_text_color
-
-            switch_app(current_app_key)
-            
-            if not is_sidebar_open:
-                nav_btn_menu_icon.color = current_text_color
-                nav_btn_menu_text.color = current_text_color
-                if t2i_page_index != 0: 
-                    nav_btn_func_icon.color = current_text_color
-                    nav_btn_func_text.color = current_text_color
-                if t2i_page_index != 1:
-                    nav_btn_gallery_icon.color = current_text_color
-                    nav_btn_gallery_text.color = current_text_color
-
-            if mode == "dark":
-                page.theme_mode = ft.ThemeMode.DARK
-                page.bgcolor = utils.BG_DARK
-                main_content_bg.bgcolor = utils.BG_DARK
-            elif mode == "warm":
-                page.theme_mode = ft.ThemeMode.LIGHT
-                page.bgcolor = utils.BG_WARM
-                main_content_bg.bgcolor = utils.BG_WARM
-            else:
-                page.theme_mode = ft.ThemeMode.LIGHT
-                page.bgcolor = utils.BG_LIGHT
-                main_content_bg.bgcolor = utils.BG_LIGHT
-            
-            dialog_bg = utils.get_dialog_bgcolor(mode)
-            settings_dialog.bgcolor = dialog_bg
-            theme_dialog.bgcolor = dialog_bg
-            power_mode_dialog.bgcolor = dialog_bg
-            
-            sidebar_container.bgcolor = utils.get_sidebar_bgcolor(mode)
-            bottom_nav_content.bgcolor = utils.get_dropdown_bgcolor(mode)
-            sidebar_div1.color = utils.get_opacity_color(0.2, current_text_color) 
-            sidebar_div2.color = utils.get_opacity_color(0.2, current_text_color)
-            
-            border_c = utils.get_border_color(mode)
-            api_keys_field.border_color = border_c
-            baidu_config_field.border_color = border_c
-            pm_limit_field.border_color = border_c
-            
-            # 更新功能菜单颜色
-            func_menu_card.bgcolor = utils.get_dropdown_bgcolor(mode)
-
-        t2i_app.update_theme(current_primary_color, current_theme_mode)
-        i2i_app.update_theme(current_primary_color, current_theme_mode)
-        # 【新增】更新历史模块主题
-        history_app.update_theme(current_primary_color, current_theme_mode)
-        image_viewer.update_theme(current_primary_color, current_theme_mode)
-
-        if theme_dialog.open:
-            theme_dialog.content = build_theme_content()
-            theme_dialog.update()
-        page.update()
-
-    def build_theme_content():
-        def color_dot(name, hex_c):
-            is_selected = (hex_c == current_primary_color)
-            return ft.Container(
-                width=45, height=45, bgcolor=hex_c, border_radius=22,
-                on_click=lambda e: page.run_task(update_global_theme, color_name=name),
-                border=ft.border.all(3, current_primary_color) if is_selected else None,
-                scale=utils.MyScale(1.1 if is_selected else 1.0) if utils.MyScale else None,
-                animate_scale=utils.MyAnimation(200, "easeOut") if utils.MyAnimation else None
-            )
-        def mode_pill(text, mode_val):
-            is_active = (mode_val == current_theme_mode)
-            return ft.Container(
-                content=ft.Text(text, color=current_primary_color if is_active else "grey", size=14),
-                padding=ft.padding.symmetric(horizontal=18, vertical=8),
-                border=ft.border.all(1.5, current_primary_color if is_active else "grey"),
-                border_radius=20,
-                bgcolor=utils.get_opacity_color(0.1, current_primary_color) if is_active else None,
-                on_click=lambda e: page.run_task(update_global_theme, mode=mode_val)
-            )
-        return ft.Column([
-            ft.Text("莫兰迪色系", size=13, color="grey"),
-            ft.Divider(height=10, color="transparent"), 
-            ft.Row([color_dot(n, h) for n, h in list(utils.MORANDI_COLORS.items())[:4]], spacing=12, alignment="start"),
-            ft.Container(height=8),
-            ft.Row([color_dot(n, h) for n, h in list(utils.MORANDI_COLORS.items())[4:]], spacing=12, alignment="start"),
-            ft.Divider(height=30, thickness=0.5, color=utils.get_opacity_color(0.2, "grey")), 
-            ft.Text("主题模式", size=13, color="grey"),
-            ft.Divider(height=10, color="transparent"),
-            ft.Row([mode_pill("护眼", "warm"), mode_pill("浅色", "light"), mode_pill("深色", "dark")], alignment="start", spacing=10)
-        ], spacing=0, horizontal_alignment="start", tight=True)
-
-    def open_theme_dialog(e):
-        theme_dialog.content = ft.Container(content=build_theme_content(), width=300, padding=ft.padding.only(top=10, left=10, right=10))
-        theme_dialog.actions = [ft.TextButton("确定", on_click=lambda e: utils.safe_close_dialog(page, theme_dialog))]
-        utils.safe_open_dialog(page, theme_dialog)
-
-    # ================= 8. 挂载与启动 =================
-    
+    # ==========================================
+    #      修改点：使用 SafeArea 包裹主内容
+    # ==========================================
     main_content_bg = ft.Container(
-        expand=True, bgcolor=utils.BG_LIGHT, padding=0,
+        expand=True, 
+        bgcolor=BG_LIGHT, 
+        padding=0,
+        # 这里加入了 ft.SafeArea，它是处理刘海屏和底部横条的专业方案
         content=ft.SafeArea(
             content=ft.Column([
                 custom_appbar,
-                # 【修改】使用容器包裹 Slider，并加入 History Container
-                t2i_slider_container,
-                history_container,
-                
+                ft.Container(content=t2i_slider, expand=True, clip_behavior=ft.ClipBehavior.HARD_EDGE),
                 ft.Container(content=dots_row, height=0 if not is_wide_mode else 35, alignment=ft.alignment.center),
                 bottom_nav 
             ], spacing=0),
-            bottom=True, top=True
+            bottom=True, # 自动避开底部横条
+            top=True     # 自动避开顶部刘海/状态栏
         )
     )
     
-    # 将功能切换菜单加入最外层 Stack
-    layout = ft.Stack([main_content_bg, mask, sidebar_container, func_menu_card, image_viewer.ui, gallery_control_gesture], expand=True)
+    layout = ft.Stack([main_content_bg, mask, sidebar_container, viewer_overlay, gallery_control_gesture], expand=True)
     page.add(layout)
-    
-    await update_global_theme(current_theme_mode, current_theme_color_name)
-    switch_app("t2i") 
-    
-    page.update()
-    await asyncio.sleep(0.1)
-    on_resize(None)
 
-    if not current_api_keys: open_settings_dialog(None)
+    # 1. ⭐️ 添加后立即手动触发一次 resize，让布局瞬间归位
+    on_resize(None) 
+    
+    nav_container_ref.content = ft.Row([
+        ft.Row([nav_icon_ref, ft.Container(width=10), nav_text_ref]), 
+        ft.Container(expand=True), 
+        nav_highlight_ref
+    ], alignment="spaceBetween")
+    
+    switch_t2i_page(0) 
+    
+    # 2. ⭐️ 确保 on_resize 后立即 update 一次，让用户第一眼看到的就是正确的
+    page.update() 
+
+    await update_theme(stored_mode, stored_color_name)
+    update_upload_area()
+    
+    # 3. ⭐️ 这里的 sleep 只用于文字的视觉延迟效果，不应该阻挡布局
+    # (此时布局已经是正常的了，用户等待时看到的是正常的界面)
+    await asyncio.sleep(0.5) 
+    
+    # 4. 更新文字
+    nav_text_ref.value = "  图片编辑"
+    nav_btn_func_text.value = "图片编辑"
+    view_switch_btn.tooltip = "查看编辑结果"
+    
+    # 5. 最后再刷新一次
+    page.update()
+
+    if not current_api_keys:
+        safe_open_dialog(settings_dialog)
 
 ft.app(target=main)
