@@ -13,21 +13,14 @@ import http.server
 import socketserver
 import threading
 import uuid
-
-# ==========================================
-#      【安全导入层】防止手机端崩溃
-# ==========================================
+from PIL import ImageGrab 
 try:
-    from PIL import ImageGrab
     HAS_PIL_GRAB = True
 except ImportError:
     HAS_PIL_GRAB = False
 except OSError:
     HAS_PIL_GRAB = False
 
-# ==========================================
-#      【核心兼容层】自动适配 Flet 版本
-# ==========================================
 try:
     MyAnimation = ft.Animation
     MyOffset = ft.Offset
@@ -42,11 +35,8 @@ except AttributeError:
         MyOffset = None
         MyScale = None
 
-# ==========================================
-#      【新增】本地微型图片服务器 (解决0KB问题)
-# ==========================================
 LOCAL_IMAGE_CACHE = {}
-LOCAL_SERVER_PORT = 28990  # 选择一个不容易冲突的端口
+LOCAL_SERVER_PORT = 28989
 
 class LocalImageHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -82,9 +72,6 @@ def start_local_server():
 
 threading.Thread(target=start_local_server, daemon=True).start()
 
-# ==========================================
-#      【全局变量与配置】
-# ==========================================
 BASE_URL = 'https://api-inference.modelscope.cn/'
 BAIDU_TRANSLATE_URL = 'https://fanyi-api.baidu.com/api/trans/vip/translate'
 I2I_FOLDER = "I2I_Edits"
@@ -93,15 +80,12 @@ if not os.path.exists(I2I_FOLDER):
     try: os.makedirs(I2I_FOLDER)
     except: pass
 
-# ⭐️ 支持多图上传的模型列表
 MODELS_REQUIRING_LIST_INPUT = [
     'Qwen/Qwen-Image-Edit-2509',
     'black-forest-labs/FLUX.2-dev',
+    'Qwen/Qwen-Image-Edit-2511',
 ]
 
-downloaded_urls = set()
-
-# ⭐️ 智能上传缓存：{ file_path: uploaded_url }
 file_upload_cache = {}
 
 MORANDI_COLORS = {    "Red": "#C85C56", "Orange": "#D98656", "Gold": "#D0A467", "Green": "#709D78",
@@ -128,6 +112,7 @@ CUSTOM_BTN_WIDTH = 68
 SEARCH_WIDTH = 70 
 
 DEFAULT_MODEL_OPTIONS = [
+    {"key": "Qwen/Qwen-Image-Edit-2511", "text": "Qwen-Image-Edit-2511 (新)"},
     {"key": "Qwen/Qwen-Image-Edit-2509", "text": "Qwen-Image-Edit-2509"},
     {"key": "black-forest-labs/FLUX.2-dev", "text": "FLUX.2-dev"},
     {"key": "Qwen/Qwen-Image-Edit", "text": "Qwen/Qwen-Image-Edit (默认)"},
@@ -144,9 +129,7 @@ SIZE_OPTIONS = [
     {"key": "1664x928", "text": "1664x928 (横屏)"},
     {"key": "2048x2048", "text": "2048x2048 (方形)"},
 ]
-# ==========================================
-#      辅助工具函数
-# ==========================================
+
 def get_opacity_color(opacity, hex_color):
     if not hex_color: return None
     if hex_color == "black": hex_color = "#000000"
@@ -159,9 +142,6 @@ def get_opacity_color(opacity, hex_color):
             return f"#{alpha_hex}{hex_color.lstrip('#')}"
     return hex_color
 
-# ==========================================
-#      元数据处理函数 (PNG Info)
-# ==========================================
 def add_metadata_to_png(image_bytes, metadata):
     try:
         png_signature = b'\x89PNG\r\n\x1a\n'
@@ -245,12 +225,7 @@ def extract_metadata_from_png(image_bytes):
         print(f"Error extracting metadata: {e}")
         return None
 
-# ==========================================
-#      【新增】图片编辑专用工具函数
-# ==========================================
-
 def get_image_size(file_path):
-    """简单的获取图片宽高函数，用于AutoSize逻辑"""
     try:
         with open(file_path, 'rb') as f:
             head = f.read(24)
@@ -260,7 +235,6 @@ def get_image_size(file_path):
                 return w, h
             elif head.startswith(b'\xff\xd8'):
                 f.seek(0)
-                ftype = 0
                 while True:
                     byte = f.read(1)
                     if not byte: break
@@ -278,11 +252,8 @@ def get_image_size(file_path):
     return None
 
 async def upload_image_to_host(file_path):
-    # ⭐️ 智能复用：先检查缓存
     if file_path in file_upload_cache:
-        print(f"Reuse cached URL for: {file_path}")
         return file_upload_cache[file_path]
-
     try:
         filename = os.path.basename(file_path)
         with open(file_path, 'rb') as f:
@@ -292,7 +263,6 @@ async def upload_image_to_host(file_path):
             data = res.json()
             if data.get('success'):
                 url = data['files'][0]['url'].replace('\\', '')
-                # ⭐️ 存入缓存
                 file_upload_cache[file_path] = url
                 return url
         return None
@@ -300,37 +270,41 @@ async def upload_image_to_host(file_path):
         print(f"Upload failed: {e}")
         return None
 
-# ==========================================
-#             Main Application
-# ==========================================
-
 async def main(page: ft.Page):
-    # ================= 1. 设置窗口属性 =================
     page.window.min_width = 380
     page.window.min_height = 600
     page.window.resizable = True   
     page.title = "魔塔AI大全 - 图片编辑"
     page.padding = 0
-    
-    # ⭐️ 初始化上传列表
-    uploaded_files = []
     page.spacing = 0
     page.appbar = None 
     try: page.expand = True 
     except: pass
 
-    # ================= 2. 读取本地存储 =================
+    uploaded_files = []
+
     try:
         stored_api_keys_str = await page.client_storage.get_async("api_keys") or ""
         stored_baidu_config = await page.client_storage.get_async("baidu_config") or ""
         stored_color_name = await page.client_storage.get_async("theme_color") or "Gold"
         stored_mode = await page.client_storage.get_async("theme_mode") or "dark"
         stored_custom_models = await page.client_storage.get_async("custom_models") or ""
+        stored_power_config = await page.client_storage.get_async("power_mode_config")
     except Exception as e:
         print(f"Error reading storage: {e}")
         stored_api_keys_str, stored_baidu_config = "", ""
         stored_color_name, stored_mode = "Gold", "dark"
         stored_custom_models = ""
+        stored_power_config = None
+
+    if not stored_power_config or not isinstance(stored_power_config, dict):
+        stored_power_config = {
+            "enabled": False,
+            "batch_size": 10,
+            "selected_keys": [],
+            "daily_limit": 200,
+            "request_delay": 0.2
+        }
 
     current_api_keys = [k.strip() for k in stored_api_keys_str.split('\n') if k.strip()]
     current_primary_color = MORANDI_COLORS.get(stored_color_name, "#D0A467")
@@ -343,8 +317,6 @@ async def main(page: ft.Page):
     t2i_page_index = 0
     is_wide_mode = False
     left_panel_visible = True
-
-    # ================= 4. 核心功能函数 =================
 
     async def save_config(key, value):
         try: await page.client_storage.set_async(key, value)
@@ -412,7 +384,6 @@ async def main(page: ft.Page):
             page.update()
             return None
 
-    # --- 【新功能】直接保存到本地 T2I 文件夹 (横屏专用) ---
     async def save_image_to_local_folder(url, metadata=None):
         if not url: return False
         try:
@@ -421,16 +392,11 @@ async def main(page: ft.Page):
                 image_bytes = res.content
                 if metadata:
                     image_bytes = add_metadata_to_png(image_bytes, metadata)
-                
-                # 生成文件名
                 timestamp = int(time.time())
                 filename = f"img_{timestamp}_{random.randint(100,999)}.png"
                 save_path = os.path.join(I2I_FOLDER, filename)
-                
-                # 写入文件
                 with open(save_path, "wb") as f:
                     f.write(image_bytes)
-                
                 page.snack_bar = ft.SnackBar(ft.Text(f"✅ 图片已保存至: {save_path}"), open=True)
                 page.update()
                 return True
@@ -443,46 +409,36 @@ async def main(page: ft.Page):
             page.update()
             return False
 
-    # --- 【新功能】通过本地服务器中转下载 (竖屏专用) ---
     async def download_via_local_server(url, metadata=None):
         if not url: return False
         try:
             page.snack_bar = ft.SnackBar(ft.Text("正在调用浏览器下载..."), open=True)
             page.update()
-            
             res = await asyncio.to_thread(requests.get, url, timeout=30)
             if res.status_code != 200:
                 raise Exception("图片下载失败")
-                
             image_bytes = res.content
             if metadata:
                 image_bytes = add_metadata_to_png(image_bytes, metadata)
-            
             token = str(uuid.uuid4())
             LOCAL_IMAGE_CACHE[token] = image_bytes
             local_url = f"http://127.0.0.1:{LOCAL_SERVER_PORT}/image/{token}.png"
-            
             page.launch_url(local_url)
             return True
-            
         except Exception as err:
             page.snack_bar = ft.SnackBar(ft.Text(f"处理失败: {str(err)}"), open=True)
             page.update()
             return False
 
-    # --- 【通用】设置按钮为已下载状态 ---
     def mark_btn_downloaded(btn):
         if btn:
             btn.icon = "check_circle"
             btn.icon_color = current_primary_color
             btn.tooltip = "已下载/已保存"
             btn.disabled = True
-            # 安全更新
             try: btn.update()
             except: pass
 
-    # ================= UI 引用与组件定义 =================
-    
     sidebar_icon_ref = ft.Icon("smart_toy", size=40, color="grey")
     sidebar_title_ref = ft.Text("魔塔AI大全", size=18, weight="bold", color="grey")
     sidebar_subtitle_ref = ft.Text("By_showevr", size=12, color="grey")
@@ -507,13 +463,8 @@ async def main(page: ft.Page):
     
     theme_dialog = ft.AlertDialog(title=ft.Text("显示与主题", weight="bold", size=14), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
     settings_dialog = ft.AlertDialog(title=ft.Text("全局设置", size=14), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
+    power_mode_dialog = ft.AlertDialog(title=ft.Row([ft.Icon("flash_on", color="amber"), ft.Text("强力生图模式", weight="bold", size=14)]), modal=True, surface_tint_color=ft.Colors.TRANSPARENT)
 
-   # ==========================================
-    #      【重构版】原生级图片查看器 (原生手势+无缝切换版)
-    #      修复：鼠标滚轮缩放、双指缩放手感、竖屏放大被裁剪问题
-    # ==========================================
-    
-    # 状态变量
     is_viewer_info_open = False 
     viewer_zoom_level = 1.0
     _viewer_drag_offset_x = 0.0
@@ -525,20 +476,13 @@ async def main(page: ft.Page):
         if not is_wide_mode and t2i_page_index == 1:
             gallery_control_gesture.visible = True
             gallery_control_gesture.update()
-
         try: viewer_overlay.update()
         except: pass
         reset_viewer_zoom(update_ui=False)
 
-    # --- 1. 图片组件初始化 ---
-    # 当前图片
     inner_viewer_img = ft.Image(src="", fit=ft.ImageFit.CONTAIN, gapless_playback=True)
-    # 预加载图片 (用于滑动时显示下一张/上一张)
     preload_viewer_img = ft.Image(src="", fit=ft.ImageFit.CONTAIN, gapless_playback=True, opacity=1)
 
-    # --- 2. 核心缩放交互层 (底层 - 负责缩放后的漫游) ---
-    
-    # 【新增】模式切换提示胶囊 (Toast)
     zoom_hint_text = ft.Text("大图模式", color="white", size=14, weight="bold")
     zoom_hint_container = ft.Container(
         content=zoom_hint_text,
@@ -551,34 +495,22 @@ async def main(page: ft.Page):
         shadow=ft.BoxShadow(blur_radius=10, color=ft.Colors.with_opacity(0.3, "black"))
     )
 
-    # 【新增】触发提示显示的异步任务
     async def show_zoom_hint_task(text):
-        # 1. 设置内容和颜色 (确保颜色是最新的)
         zoom_hint_text.value = text
         zoom_hint_container.bgcolor = get_opacity_color(0.7, current_primary_color)
-        
-        # 2. 显示
         zoom_hint_container.visible = True
         zoom_hint_container.opacity = 1
         zoom_hint_container.update()
-        
-        # 3. 停留 0.5 秒
         await asyncio.sleep(0.5)
-        
-        # 4. 渐隐
         zoom_hint_container.opacity = 0
         zoom_hint_container.update()
-        
-        # 5. 等待动画结束彻底隐藏
         await asyncio.sleep(0.3)
         zoom_hint_container.visible = False
         zoom_hint_container.update()
 
-    # 【新增】辅助调用函数
     def trigger_zoom_hint(text):
         page.run_task(show_zoom_hint_task, text)
 
-    # 【修改后的】手机端模式切换逻辑
     is_mobile_zoom_mode = False
 
     def toggle_mobile_zoom_mode(enable):
@@ -586,13 +518,10 @@ async def main(page: ft.Page):
         is_mobile_zoom_mode = enable
         
         outer_gesture_detector.visible = not enable
-        
         if enable:
-            # ======= 进入大图模式 =======
             interactive_viewer.scale = 1.2
             prev_btn.visible = False
             next_btn.visible = False
-            
             viewer_controls_container.visible = False
             trigger_zoom_hint("大图模式")
         else:
@@ -608,7 +537,6 @@ async def main(page: ft.Page):
             interactive_viewer.update()
             prev_btn.update()
             next_btn.update()
-
             viewer_controls_container.update()
             update_viewer_layout_content()
         except: pass
@@ -620,7 +548,6 @@ async def main(page: ft.Page):
             toggle_mobile_zoom_mode(False)
 
     inner_gesture = ft.GestureDetector(
-        # 给图片包一层 Container 并居中
         content=ft.Container(
             content=inner_viewer_img,
             alignment=ft.alignment.center, 
@@ -641,7 +568,6 @@ async def main(page: ft.Page):
         boundary_margin=ft.padding.all(800)
     )
 
-    # --- 3. 滑动容器层 ---
     swipe_anim_container = ft.Container(
         content=interactive_viewer,
         offset=MyOffset(0, 0) if MyOffset else None,
@@ -659,45 +585,33 @@ async def main(page: ft.Page):
         visible=False 
     )
 
-    # --- 4. 顶层手势检测 (负责翻页 + 宽屏鼠标滚轮) ---
-    
-    # 顶层双击（默认模式下触发）
     def on_outer_double_tap(e):
         if is_wide_mode:
             reset_viewer_zoom(True)
         else:
-            # 手机端：双击进入缩放模式，隐藏遮罩
             toggle_mobile_zoom_mode(True)
 
-    # 【分离优化】鼠标滚轮 - 仅宽屏/桌面模式生效
     def on_outer_scroll(e: ft.ScrollEvent):
-        if not is_wide_mode: return # 手机端禁用滚轮逻辑，防止冲突
-        
-        # 桌面端简单逻辑：滚动即放大
+        if not is_wide_mode: return 
         if e.scroll_delta_y != 0:
             if interactive_viewer.scale < 1.1:
                  interactive_viewer.scale = 1.2
-                 outer_gesture_detector.visible = False # 桌面端保持原有逻辑
+                 outer_gesture_detector.visible = False
                  try: 
                      interactive_viewer.update()
                      outer_gesture_detector.update()
                  except: pass
 
-    # 【分离优化】双指缩放更新 - 仅宽屏/桌面模式生效
     def on_outer_scale_update(e: ft.ScaleUpdateEvent):
-        if not is_wide_mode: return # 手机端完全交给底层原生处理，此处不干扰
-        
+        if not is_wide_mode: return 
         current_preview_scale = max(1.0, e.scale)
         interactive_viewer.scale = current_preview_scale
         try: interactive_viewer.update()
         except: pass
 
-    # 【分离优化】双指缩放结束 - 仅宽屏/桌面模式生效
     def on_outer_scale_end(e: ft.ScaleEndEvent):
         if not is_wide_mode: return
-        
         if interactive_viewer.scale > 1.1:
-            # 桌面端：切换到底层
             outer_gesture_detector.visible = False
             try: outer_gesture_detector.update()
             except: pass
@@ -706,12 +620,9 @@ async def main(page: ft.Page):
 
     def on_outer_pan_update(e: ft.DragUpdateEvent):
         nonlocal _viewer_drag_offset_x
-        # 只有在未放大时才允许翻页滑动
         if viewer_zoom_level > 1.1: return 
-
         width = page.width if page.width and page.width > 0 else 360
         _viewer_drag_offset_x += e.delta_x
-        
         ratio = _viewer_drag_offset_x / width
         
         if MyOffset:
@@ -721,7 +632,6 @@ async def main(page: ft.Page):
         if abs(_viewer_drag_offset_x) > 10: 
             preload_container.visible = True
             preload_container.animate_offset = None
-            
             target_index = -1
             preload_start_x = 0.0
             
@@ -746,10 +656,8 @@ async def main(page: ft.Page):
     async def on_outer_pan_end(e: ft.DragEndEvent):
         nonlocal _viewer_drag_offset_x
         if viewer_zoom_level > 1.1: return
-
         width = page.width if page.width and page.width > 0 else 360
         threshold = 60
-        
         anim = MyAnimation(300, "easeOut") if MyAnimation else None
         swipe_anim_container.animate_offset = anim
         preload_container.animate_offset = anim
@@ -764,7 +672,6 @@ async def main(page: ft.Page):
             await navigate_viewer(-1)
         else:
             reset_drag_position()
-        
         _viewer_drag_offset_x = 0
 
     def reset_drag_position():
@@ -799,7 +706,7 @@ async def main(page: ft.Page):
         nonlocal viewer_zoom_level, _viewer_drag_offset_x, is_mobile_zoom_mode
         viewer_zoom_level = 1.0
         _viewer_drag_offset_x = 0.0
-        is_mobile_zoom_mode = False # 重置手机缩放状态
+        is_mobile_zoom_mode = False 
         
         interactive_viewer.scale = 1.0
         outer_gesture_detector.visible = True 
@@ -822,21 +729,17 @@ async def main(page: ft.Page):
     current_viewer_index = 0
     is_animating = False 
     
-    # 背景容器 (Stack 布局)
     viewer_image_stack_content = ft.Stack([
         preload_container,       
         swipe_anim_container,    
         outer_gesture_detector,
-        # 【最终修复】直接将提示胶囊放入 Stack，利用 Stack 的 alignment 属性居中
-        # 这样提示胶囊只占据自身大小的空间，不会遮挡周围的触摸区域
         zoom_hint_container  
-    ], expand=True, alignment=ft.alignment.center) # <--- 关键：设置 Stack 内容居中对齐
+    ], expand=True, alignment=ft.alignment.center)
 
     viewer_background_container = ft.Container(
         expand=True, alignment=ft.alignment.center, content=viewer_image_stack_content
     )
 
-    # --- UI 显隐逻辑 ---
     def toggle_overlay_ui(e):
         current_vis = viewer_controls_container.visible
         new_vis = not current_vis
@@ -845,11 +748,9 @@ async def main(page: ft.Page):
         prev_btn.visible = new_vis and is_wide_mode 
         next_btn.visible = new_vis and is_wide_mode
         
-        # 强制刷新布局
         update_viewer_layout_content()
 
 
-    # --- 信息面板组件 ---
     viewer_info_prompt = ft.Text("无", selectable=True, size=13, color=current_primary_color)
     viewer_info_neg = ft.Text("无", selectable=True, size=13, color=current_primary_color)
     viewer_title_prompt = ft.Text("Prompt", size=11, weight="bold", color=current_primary_color)
@@ -866,7 +767,6 @@ async def main(page: ft.Page):
         ft.Container(content=viewer_info_neg),
     ], scroll=ft.ScrollMode.ALWAYS, expand=True)
 
-    # 【关键修改】Info容器现在是Overlay的一部分，不再影响主布局结构
     viewer_info_container = ft.Container(
         content=viewer_text_col,
         padding=15, 
@@ -874,21 +774,17 @@ async def main(page: ft.Page):
         border_radius=ft.border_radius.only(top_left=15, top_right=15),
         shadow=ft.BoxShadow(blur_radius=15, color=ft.Colors.with_opacity(0.3, "black")),
         expand=True,
-        visible=False, # 默认隐藏
+        visible=False, 
         animate_opacity=200,
         opacity=0
     )
     
-    # 翻页函数
-    # 【重写-最终修复版】异步丝滑切换函数 (解决动画不触发问题)
     async def navigate_viewer(delta):
         nonlocal current_viewer_index, is_animating, _viewer_drag_offset_x
-        if is_animating: return # 动画中禁止操作
+        if is_animating: return 
         if not current_viewer_grid_images: return
-        
         new_index = current_viewer_index + delta
         
-        # 边界检查
         if new_index < 0:
             reset_drag_position()
             page.snack_bar = ft.SnackBar(ft.Text("已经是第一张了"), open=True)
@@ -900,43 +796,27 @@ async def main(page: ft.Page):
             page.update()
             return
 
-        # 锁定状态
         is_animating = True
         target_img_obj = current_viewer_grid_images[new_index]
-        
-        # 1. 准备预加载层
         preload_viewer_img.src = target_img_obj.src
         preload_container.visible = True
         
-        # 计算方向
-        # delta > 0 (下一张): 预加载从右(1)进，主图往左(-1)出
-        # delta < 0 (上一张): 预加载从左(-1)进，主图往右(1)出
         start_preload_x = 1.0 if delta > 0 else -1.0
         end_main_x = -1.0 if delta > 0 else 1.0
         
-        # 如果是点击触发（当前未拖动，offset为0），需要先把预加载层瞬移到位
         if swipe_anim_container.offset.x == 0:
             preload_container.animate_offset = None
             preload_container.offset = MyOffset(start_preload_x, 0)
             preload_container.update()
         
-        # ==================================================
-        # 【核心修复】分步激活：先开启动画，刷新，再移动
-        # ==================================================
-        
-        # 步骤 A: 告诉引擎 "开启 300ms 动画"
         anim_setting = MyAnimation(300, "easeOut") if MyAnimation else None
         swipe_anim_container.animate_offset = anim_setting
         preload_container.animate_offset = anim_setting
         
-        # 强制刷新状态，让引擎消化这个设置
         swipe_anim_container.update()
         preload_container.update()
-        
-        # 关键停顿！让动画属性生效（给一点点时间让前端渲染层感知状态变化）
         await asyncio.sleep(0.05)
         
-        # 步骤 B: 此时引擎已准备好，现在设置新坐标，它就会平滑滑过去了
         swipe_anim_container.offset = MyOffset(end_main_x, 0)
         preload_container.offset = MyOffset(0, 0)
         
@@ -945,22 +825,17 @@ async def main(page: ft.Page):
             preload_container.update()
         except: pass
         
-        # ==================================================
-        
-        # 4. 等待动画播放完毕 (稍微多给一点时间，防止剪切)
         await asyncio.sleep(0.35)
         
-        # 5. 偷天换日：数据归位
         current_viewer_index = new_index
-        inner_viewer_img.src = target_img_obj.src # 主图换成新图
+        inner_viewer_img.src = target_img_obj.src 
         reset_viewer_zoom(update_ui=False)
         
-        # 瞬间归位（关闭动画）
         swipe_anim_container.animate_offset = None
         preload_container.animate_offset = None
         
-        swipe_anim_container.offset = MyOffset(0, 0) # 主图回正
-        preload_container.offset = MyOffset(1.0, 0)  # 预加载图踢开
+        swipe_anim_container.offset = MyOffset(0, 0) 
+        preload_container.offset = MyOffset(1.0, 0)  
         preload_container.visible = False
         
         try:
@@ -968,7 +843,6 @@ async def main(page: ft.Page):
             preload_container.update()
         except: pass
         
-        # 6. 更新UI信息
         meta = getattr(target_img_obj, "data", None)
         if meta:
             viewer_info_prompt.value = meta.get("prompt", "无")
@@ -979,19 +853,15 @@ async def main(page: ft.Page):
         
         sync_viewer_btns_state()
         
-        # 更新按钮禁用状态
         total = len(current_viewer_grid_images)
         prev_btn.disabled = (current_viewer_index <= 0)
         next_btn.disabled = (current_viewer_index >= total - 1)
-        
         try: viewer_overlay.update()
         except: pass
         
-        # 解锁
         is_animating = False
         _viewer_drag_offset_x = 0
 
-    # 左右翻页按钮 (仅横屏) - 【修复】使用标准的 async wrapper 确保点击生效
     async def on_prev_click(e):
         await navigate_viewer(-1)
 
@@ -1001,16 +871,12 @@ async def main(page: ft.Page):
     prev_btn = ft.IconButton("chevron_left", icon_color="white", icon_size=30, bgcolor=get_opacity_color(0.3, "black"), on_click=on_prev_click, visible=False, tooltip="上一张")
     next_btn = ft.IconButton("chevron_right", icon_color="white", icon_size=30, bgcolor=get_opacity_color(0.3, "black"), on_click=on_next_click, visible=False, tooltip="下一张")
     
-    # 【关键修改】Viewer Stack布局重构，确保info overlay不影响image stack
-    # 这里定义各个独立的Container，后面在 update_viewer_layout_content 组装
-    
     viewer_control_btns = []
     def create_control_btn(icon_name, tooltip, func):
         btn = ft.IconButton(icon=icon_name, icon_color="white", icon_size=20, tooltip=tooltip, on_click=func, bgcolor="transparent")
         viewer_control_btns.append(btn)
         return btn
     
-    # --- 按钮逻辑 ---
     async def on_viewer_save_local(e):
         if inner_viewer_img.src:
             img_obj = current_viewer_grid_images[current_viewer_index]
@@ -1071,7 +937,6 @@ async def main(page: ft.Page):
     btn_browser_dl = create_control_btn("public", "浏览器下载", on_viewer_browser_dl)
     btn_close = create_control_btn("close", "关闭", close_viewer)
 
-    # 底部控制栏
     viewer_controls_row = ft.Row(
         controls=[btn_info, btn_reset, btn_browser_dl, viewer_dl_btn, ft.Container(width=1, height=20, bgcolor="white54"), btn_close], 
         alignment=ft.MainAxisAlignment.END, spacing=5
@@ -1083,12 +948,7 @@ async def main(page: ft.Page):
         bgcolor=ft.Colors.TRANSPARENT 
     )
 
-    # ================= 布局动态构建核心 (完美显隐版) =================
-    
-    # 0. 重新确保信息面板内部结构的完整性
-    viewer_text_col = ft.Column([
-        # 初始为空，由 update_viewer_layout_content 填充
-    ], scroll=ft.ScrollMode.ALWAYS, expand=True)
+    viewer_text_col = ft.Column([], scroll=ft.ScrollMode.ALWAYS, expand=True)
 
     viewer_info_container = ft.Container(
         content=viewer_text_col,
@@ -1098,37 +958,33 @@ async def main(page: ft.Page):
         expand=True
     )
 
-    # 1. 定义信息面板的外壳 (竖屏动画用)
     viewer_info_wrapper = ft.Container(
         content=viewer_info_container,
-        height=0,  # 默认高度为0 (隐藏)
+        height=0, 
         animate=MyAnimation(300, "easeOut") if MyAnimation else None,
         clip_behavior=ft.ClipBehavior.HARD_EDGE, 
         bgcolor=ft.Colors.TRANSPARENT,
     )
 
-    # 2. 定义左侧主区域
     viewer_main_column = ft.Column(
         spacing=0,
         controls=[
             ft.Container(
                 content=ft.Stack([
-                    viewer_background_container, # 图片显示层
+                    viewer_background_container, 
                     ft.Container(content=prev_btn, left=15, top=0, bottom=0, alignment=ft.alignment.center_left, width=60),
                     ft.Container(content=next_btn, right=15, top=0, bottom=0, alignment=ft.alignment.center_right, width=60),
                 ], expand=True),
                 expand=True, 
             ),
-            viewer_info_wrapper, # 竖屏时用于顶起图片的容器
+            viewer_info_wrapper, 
             ft.Container(content=viewer_controls_container, bgcolor=ft.Colors.TRANSPARENT)
         ],
         expand=True
     )
 
-    # 3. 定义宽屏侧边栏的文本容器
     wide_sidebar_info_col = ft.Column(scroll=ft.ScrollMode.ALWAYS, expand=True)
 
-    # 4. 定义宽屏侧边栏 (默认隐藏)
     wide_sidebar_container = ft.Container(
         width=320,
         bgcolor=ft.Colors.TRANSPARENT,
@@ -1137,10 +993,9 @@ async def main(page: ft.Page):
             ft.Container(content=wide_sidebar_info_col, padding=15, expand=True),
             ft.Divider(height=1, color="white24"),
         ], spacing=0, expand=True),
-        visible=False # 初始状态设为隐藏
+        visible=False 
     )
 
-    # 5. 最终布局
     final_viewer_layout = ft.Row(
         controls=[
             viewer_main_column,
@@ -1150,16 +1005,12 @@ async def main(page: ft.Page):
         expand=True
     )
 
-    # 6. 布局更新逻辑
     def update_viewer_layout_content():
         bg_color = get_dropdown_bgcolor()
-        
-        # 同步背景色
         viewer_info_wrapper.bgcolor = bg_color
         viewer_info_container.bgcolor = bg_color
         wide_sidebar_container.bgcolor = bg_color
         
-        # 准备组件列表
         info_controls_list = [
             ft.Row([viewer_title_prompt, viewer_copy_prompt_btn], alignment="spaceBetween"),
             ft.Container(content=viewer_info_prompt, padding=ft.padding.only(bottom=5)), 
@@ -1169,36 +1020,22 @@ async def main(page: ft.Page):
         ]
 
         if is_wide_mode:
-            # === 宽屏模式 ===
-            # 【关键修改】侧边栏的显隐现在完全由 is_viewer_info_open 控制
             wide_sidebar_container.visible = is_viewer_info_open 
-            
             viewer_main_column.controls[2].bgcolor = bg_color
-
-            # 搬运组件到右侧
             viewer_text_col.controls.clear() 
             wide_sidebar_info_col.controls = info_controls_list 
-            
-            # 隐藏竖屏的Wrapper
             viewer_info_wrapper.height = 0
-            
             prev_btn.visible = True
             next_btn.visible = True
 
         else:
-            # === 竖屏模式 ===
             wide_sidebar_container.visible = False
-            
             if is_viewer_info_open:
                 viewer_main_column.controls[2].bgcolor = bg_color 
             else:
                 viewer_main_column.controls[2].bgcolor = ft.Colors.TRANSPARENT
-            
-            # 搬运组件到底部
             wide_sidebar_info_col.controls.clear() 
             viewer_text_col.controls = info_controls_list 
-
-            # 控制Wrapper高度
             if is_viewer_info_open:
                 viewer_info_wrapper.height = 200 
                 viewer_info_container.visible = True
@@ -1206,11 +1043,9 @@ async def main(page: ft.Page):
             else:
                 viewer_info_wrapper.height = 0   
                 viewer_info_wrapper.opacity = 0
-                
             prev_btn.visible = False
             next_btn.visible = False
 
-        # 强制刷新
         try:
             viewer_text_col.update()
             wide_sidebar_info_col.update()
@@ -1220,7 +1055,6 @@ async def main(page: ft.Page):
             wide_sidebar_container.update()
         except: pass
 
-    # 7. 查看器覆盖层 (【修复】确保它没有缩进到上面的函数内)
     viewer_overlay = ft.Container(
         content=final_viewer_layout, 
         visible=False, 
@@ -1233,7 +1067,6 @@ async def main(page: ft.Page):
         if not src: return
         nonlocal current_viewer_grid_images, current_viewer_index, is_viewer_info_open
         
-        # 【关键】每次打开大图时，强制重置为“不显示信息”
         is_viewer_info_open = False 
         btn_info.icon = "info_outline"
         
@@ -1356,7 +1189,6 @@ async def main(page: ft.Page):
         else: model_dropdown.value = None
         model_dropdown.update()
 
-    # --- 模型下拉菜单相关逻辑 ---
     def on_model_change(e):
         update_upload_area()
 
@@ -1368,11 +1200,11 @@ async def main(page: ft.Page):
 
     model_dropdown = ft.Dropdown(
         options=[ft.dropdown.Option(m["key"], m["text"]) for m in get_all_models()],
-        value=DEFAULT_MODEL_OPTIONS[2]["key"], # 默认选中第3个
+        value=DEFAULT_MODEL_OPTIONS[0]["key"], 
         text_size=14, content_padding=ft.padding.only(left=10, right=10, bottom=5),
         border_color="transparent", border_width=0, fill_color=get_dropdown_bgcolor(), bgcolor=get_dropdown_fill_color(),
         focused_bgcolor=ft.Colors.TRANSPARENT, expand=True,
-        on_change=on_model_change # ⭐️ 绑定变更事件
+        on_change=on_model_change 
     )
     
     model_dropdown_container = ft.Container(content=model_dropdown, height=INPUT_HEIGHT, border=ft.border.all(1, get_border_color()), border_radius=8, expand=True, alignment=ft.alignment.center_left)
@@ -1404,16 +1236,12 @@ async def main(page: ft.Page):
     async def on_prompt_blur(e): await hide_prompt_actions(e, prompt_trans_row)
     async def on_neg_blur(e): await hide_prompt_actions(e, neg_trans_row)
 
-    # ==========================================
-    #      【新增】缺失的元数据读取函数
-    # ==========================================
     def apply_metadata_from_path(file_path):
         if not file_path: return
         try:
             with open(file_path, 'rb') as f:
                 image_bytes = f.read()
             
-            # 使用全局工具函数提取信息
             meta = extract_metadata_from_png(image_bytes)
             
             if meta and isinstance(meta, dict):
@@ -1433,9 +1261,6 @@ async def main(page: ft.Page):
         except Exception as e:
             print(f"元数据读取失败: {e}")
 
-    # ==========================================
-    #      ⭐️ 上传区域逻辑与UI (已修复)
-    # ==========================================
     upload_content_container = ft.Container()
 
     def remove_image(idx):
@@ -1444,7 +1269,6 @@ async def main(page: ft.Page):
             update_upload_area()
 
     def update_upload_area():
-        # 判断当前模型是否支持多图
         is_multi_mode = model_dropdown.value in MODELS_REQUIRING_LIST_INPUT
         
         placeholder = ft.Column([
@@ -1462,12 +1286,11 @@ async def main(page: ft.Page):
                     allowed_extensions=["png", "jpg", "jpeg", "webp"]
                 )
             )
-            # 必须调用 update 才能刷新界面
-            upload_content_container.update()
+            try: upload_content_container.update()
+            except: pass
             return
 
         if not is_multi_mode:
-            # 单图模式显示
             file_path = uploaded_files[0]
             img_view = ft.Image(src=file_path, fit=ft.ImageFit.CONTAIN, border_radius=8)
             clear_btn = ft.Container(
@@ -1478,10 +1301,8 @@ async def main(page: ft.Page):
                 ft.Container(content=img_view, padding=5, alignment=ft.alignment.center),
                 clear_btn
             ])
-            # 点击图片也可以重新上传
             upload_content_container.on_click = lambda _: upload_file_picker.pick_files(allow_multiple=False, allowed_extensions=["png", "jpg", "jpeg", "webp"])
         else:
-            # 多图模式显示
             thumbs = []
             for i, path in enumerate(uploaded_files):
                 img_thumb = ft.Image(src=path, fit=ft.ImageFit.COVER, width=100, height=100, border_radius=8)
@@ -1513,24 +1334,21 @@ async def main(page: ft.Page):
             )
             upload_content_container.on_click = None
 
-        upload_content_container.update()
+        try: upload_content_container.update()
+        except: pass
 
     def on_upload_file_picked(e: ft.FilePickerResultEvent):
         if e.files:
             try:
                 is_multi = model_dropdown.value in MODELS_REQUIRING_LIST_INPUT
                 new_paths = [f.path for f in e.files]
-                
                 if is_multi:
                     uploaded_files.extend(new_paths)
                 else:
                     uploaded_files.clear()
                     uploaded_files.append(new_paths[0])
-
             except Exception as err:
                 print(f"文件处理错误: {err}")
-            
-            # 无论如何都要刷新UI
             update_upload_area()
 
     upload_file_picker = ft.FilePicker(on_result=on_upload_file_picked)
@@ -1549,7 +1367,6 @@ async def main(page: ft.Page):
     meta_file_picker = ft.FilePicker(on_result=lambda e: apply_metadata_from_path(e.files[0].path) if e.files else None)
     page.overlay.append(meta_file_picker)
 
-    # ⭐️ 修改了 hint_text
     prompt_input = ft.TextField(
         hint_text="编辑指令 (例如: 把衣服改成红色)...", multiline=True, expand=True, text_size=13, bgcolor="transparent", 
         filled=False, border=ft.InputBorder.NONE, content_padding=ft.padding.only(left=10, top=10, right=10, bottom=32),
@@ -1566,8 +1383,7 @@ async def main(page: ft.Page):
 
     prompt_container = ft.Container(
         content=ft.Stack([prompt_input, prompt_trans_row], expand=True), 
-        height=120,  # <--- 【修改点】强制固定高度为 120
-        # expand=True, <--- 【修改点】删除了 expand，不再自动撑开
+        height=120,  
         border=ft.border.all(1, get_border_color()), border_radius=10, on_click=lambda e: prompt_input.focus()
     )
 
@@ -1589,7 +1405,7 @@ async def main(page: ft.Page):
     )
 
     size_dropdown = ft.Dropdown(
-        options=[ft.dropdown.Option(s["key"], s["text"]) for s in SIZE_OPTIONS], value="AutoSize", # 默认 AutoSize
+        options=[ft.dropdown.Option(s["key"], s["text"]) for s in SIZE_OPTIONS], value="AutoSize", 
         text_size=14, content_padding=ft.padding.only(left=10, right=10, bottom=5), border_color="transparent", border_width=0,
         fill_color=get_dropdown_bgcolor(), bgcolor=get_dropdown_fill_color(), focused_bgcolor=ft.Colors.TRANSPARENT, expand=True
     )
@@ -1639,7 +1455,6 @@ async def main(page: ft.Page):
             expand=True, 
             active_color=current_primary_color
         )
-        
         val_text = ft.Text(str(def_v), width=40, size=14, text_align="center")
 
         def on_change(e):
@@ -1678,34 +1493,24 @@ async def main(page: ft.Page):
     )
     seed_row = ft.Row([ft.Text("随机种子", size=14, width=60, color="grey"), seed_input], alignment="center", vertical_alignment="center")
 
-    # ⭐️ 修改了文本和图标
     generate_btn = ft.ElevatedButton(
         "开始编辑", icon="auto_fix_high", bgcolor=current_primary_color, color="white", height=50, style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)), width=float("inf")
     )
 
     results_grid = ft.GridView(expand=True, runs_count=None, max_extent=350, child_aspect_ratio=1.0, spacing=10, run_spacing=10, padding=10)
     
-    # ================= 5. 结果卡片 UI (修改版 - 带Loading动画) =================
-    
     def create_result_card_ui(index):
-        img = ft.Image(src="", fit=ft.ImageFit.CONTAIN, visible=False, expand=True, animate_opacity=300, border_radius=10)
-        img.is_downloaded = False # 初始化标记
+        img = ft.Image(src="", fit=ft.ImageFit.COVER, visible=False, expand=True, animate_opacity=300, border_radius=10)
+        img.is_downloaded = False 
         
-        # --- 🎨 新增：加载动画组件 ---
-        # 1. 定义圆圈动画 (颜色跟随当前主题)
         loading_ring = ft.ProgressRing(width=25, height=25, stroke_width=3, color=current_primary_color)
-        
-        # 2. 定义状态文字 (颜色跟随当前主题，稍微缩小一点字号显得精致)
         status_text = ft.Text(f"排队中...", size=11, color=current_primary_color, text_align="center")
-        
-        # 3. 将它们垂直排列
-        # 将 ring 绑定到 text 对象上，方便后续逻辑函数调用
         status_text.associated_ring = loading_ring 
 
         loading_col = ft.Column(
             controls=[
                 loading_ring,
-                ft.Container(height=5), # 间距
+                ft.Container(height=5),
                 status_text
             ],
             alignment=ft.MainAxisAlignment.CENTER,
@@ -1766,14 +1571,12 @@ async def main(page: ft.Page):
         btn_browser.on_click = on_browser_click
         btn_dl.on_click = on_dl_click
         
-        # 互相关联
         img.associated_browser_btn = btn_browser
         img.associated_dl_btn = btn_dl
         
         img_container = ft.Container(content=img, expand=True, border_radius=10, on_click=lambda e: show_image_viewer(img.src) if img.src else None)
         action_bar = ft.Row([btn_info, btn_browser, btn_dl], alignment="end", spacing=0)
         
-        # ⭐️ 布局修改：底层容器现在 content 是 loading_col
         card_stack = ft.Stack([
             ft.Container(content=loading_col, alignment=ft.alignment.center, bgcolor=get_opacity_color(0.05, "black"), border_radius=10, expand=True),
             img_container, meta_overlay, ft.Container(content=action_bar, right=0, bottom=0) 
@@ -1784,45 +1587,57 @@ async def main(page: ft.Page):
         return card, img, status_text, btn_dl, btn_info, btn_browser
 
     async def run_gen(e):
-        # 【修改】移除了这里的跳转逻辑，推迟到上传成功后
-        
         nonlocal current_api_keys
-        # ... (保持原有的 Key校验、文件校验、Prompt校验不变) ...
+        
         if not prompt_input.value:
             page.snack_bar = ft.SnackBar(ft.Text("请输入编辑指令"), open=True)
             page.update()
             return
+        
+        is_power_mode = stored_power_config.get("enabled", False)
+        keys_to_use = []
+        clean_api_keys = [k.strip() for k in current_api_keys if k and k.strip()]
+        
+        if is_power_mode:
+            selected = stored_power_config.get("selected_keys", [])
+            clean_selected = [k.strip() for k in selected if k and k.strip()]
+            keys_to_use = [k for k in clean_api_keys if k in clean_selected]
+            if not keys_to_use:
+                page.snack_bar = ft.SnackBar(ft.Text("❌ 强力模式已开启，但未检测到有效勾选的 API Key"), open=True)
+                page.update()
+                return
+        else:
+            keys_to_use = clean_api_keys
 
-        # 【修改】移除了这里的 switch_t2i_page(1)
+        if not keys_to_use:
+            page.snack_bar = ft.SnackBar(ft.Text("请先设置 API Key"), open=True)
+            page.update()
+            return
 
         generate_btn.disabled = True
         generate_btn.text = "上传图片中..."
         generate_btn.update()
-        generate_btn.text = "上传图片中..."
-        generate_btn.update()
         
-        # ⭐️ 1. 智能设置 Grid 比例 (AutoSize)
         target_size = size_dropdown.value
         aspect_ratio = 1.0
         
-        if target_size == "AutoSize":
-            # 尝试从第一张图获取比例
-            if uploaded_files:
-                dims = get_image_size(uploaded_files[0])
-                if dims:
-                    w, h = dims
-                    aspect_ratio = w / h
-        else:
-            try:
-                parts = target_size.split('x')
+        try:
+            if target_size == "AutoSize":
+                if uploaded_files:
+                    dims = get_image_size(uploaded_files[0])
+                    if dims and dims[1] != 0:
+                        aspect_ratio = dims[0] / dims[1]
+            else:
+                clean_size = target_size.split()[0]
+                parts = clean_size.split('x')
                 if len(parts) == 2:
-                    w, h = int(parts[0]), int(parts[1])
-                    aspect_ratio = w / h
-            except: pass
-            
+                    aspect_ratio = float(parts[0]) / float(parts[1])
+        except Exception:
+            aspect_ratio = 1.0
+
         results_grid.child_aspect_ratio = aspect_ratio
+        results_grid.update()
         
-        # ⭐️ 2. 智能上传/复用 URL
         image_url_param = None
         current_model = model_dropdown.value
         is_multi = current_model in MODELS_REQUIRING_LIST_INPUT
@@ -1830,7 +1645,6 @@ async def main(page: ft.Page):
         try:
             uploaded_urls_list = []
             for path in uploaded_files:
-                # 调用智能上传函数（含缓存）
                 url = await upload_image_to_host(path)
                 if url:
                     uploaded_urls_list.append(url)
@@ -1848,6 +1662,7 @@ async def main(page: ft.Page):
             generate_btn.text = "开始编辑"
             generate_btn.update()
             return
+        
         if is_wide_mode and left_panel_visible: 
             toggle_left_panel(None)
         
@@ -1862,7 +1677,6 @@ async def main(page: ft.Page):
         
         tasks_ui = []
         for i in range(batch_count):
-            # 使用 T2I 原有的卡片创建函数 (返回 6 个元素)
             card, img, status, btn_dl, btn_info, btn_browser = create_result_card_ui(i)
             results_grid.controls.append(card)
             tasks_ui.append((img, status, btn_dl, btn_info, btn_browser))
@@ -1873,7 +1687,6 @@ async def main(page: ft.Page):
         async def generate_single_image(idx, api_key, ui_refs):
             img_ref, status_ref, dl_ref, info_ref, browser_ref = ui_refs
             
-            # 辅助函数：控制 Ring 的显隐
             def toggle_ring(visible):
                 if hasattr(status_ref, "associated_ring"):
                     status_ref.associated_ring.visible = visible
@@ -1881,7 +1694,6 @@ async def main(page: ft.Page):
                     except: pass
 
             try:
-                # 开始时显示动画
                 toggle_ring(True)
                 status_ref.value = "提交中..."
                 status_ref.color = current_primary_color
@@ -1899,7 +1711,6 @@ async def main(page: ft.Page):
                 if seed_val == -1: seed_val = random.randint(1, 10000000)
                 current_seed = seed_val + idx 
 
-                # ⭐️ 3. 构建 Payload
                 payload = {
                     "model": current_model,
                     "image_url": image_url_param, 
@@ -1943,7 +1754,6 @@ async def main(page: ft.Page):
                     cn_status = STATUS_TRANSLATIONS.get(raw_status, raw_status)
                     
                     if raw_status == "SUCCEED":
-                        # 成功时隐藏动画
                         toggle_ring(False)
 
                         output_images = data.get("output_images", [])
@@ -1976,12 +1786,11 @@ async def main(page: ft.Page):
                     elif raw_status == "FAILED":
                         raise Exception(data.get("message", "API Error"))
                     else:
-                        status_ref.value = f"{cn_status}..." # 简化文案
+                        status_ref.value = f"{cn_status}..."
                         status_ref.update()
                 raise Exception("超时")
 
             except Exception as e:
-                # 失败时隐藏动画
                 toggle_ring(False)
                 status_ref.value = "失败"
                 status_ref.tooltip = str(e)
@@ -1990,10 +1799,12 @@ async def main(page: ft.Page):
                 return False
 
         tasks = []
+        delay_time = float(stored_power_config.get("request_delay", 0.2))
+
         for i in range(batch_count):
-            # ✅ 修正：使用 current_api_keys
-            key_to_use = current_api_keys[i % len(current_api_keys)]
+            key_to_use = keys_to_use[i % len(keys_to_use)]
             tasks.append(asyncio.create_task(generate_single_image(i, key_to_use, tasks_ui[i])))
+            await asyncio.sleep(delay_time)
         
         await asyncio.gather(*tasks, return_exceptions=True)
         generate_btn.disabled = False
@@ -2005,14 +1816,13 @@ async def main(page: ft.Page):
     def on_file_drop(e: ft.FilePickerResultEvent):
         files = e.files
         if not files: return
+        uploaded_files.clear()
+        uploaded_files.append(files[0].path)
+        update_upload_area()
+        apply_metadata_from_path(files[0].path)
 
     page.on_file_drop = on_file_drop
 
-    # ==========================================
-    #      【重构】页面布局与自适应逻辑
-    # ==========================================
-
-    # 1. 重新定义参数列表容器 (移除 generate_btn)
     page1_scroll_col = ft.Column([
             model_row,
             ft.Container(height=8),
@@ -2032,29 +1842,24 @@ async def main(page: ft.Page):
             ft.Container(height=5),
             seed_row,
             ft.Container(height=15),
-            # 注意：generate_btn 已在此处被移除，移至底部固定栏
-    ], spacing=0, horizontal_alignment="stretch", expand=True, scroll=ft.ScrollMode.AUTO) # <--- 【修改点】添加了 scroll=ft.ScrollMode.AUTO
+    ], spacing=0, horizontal_alignment="stretch", expand=True, scroll=ft.ScrollMode.AUTO)
 
-    # 2. 新增：底部固定按钮区域
     fixed_bottom_action_bar = ft.Container(
-    content=generate_btn,
-    padding=ft.padding.symmetric(horizontal=0, vertical=10),
-    bgcolor=ft.Colors.TRANSPARENT, # 改为透明
-    border=None, # 移除边框
-)
+        content=generate_btn,
+        padding=ft.padding.symmetric(horizontal=0, vertical=10),
+        bgcolor=ft.Colors.TRANSPARENT, 
+        border=None,
+    )
 
-    # 3. 重组 page1_content (滚动区 + 固定底部)
     page1_content = ft.Container(
         padding=ft.padding.symmetric(horizontal=5, vertical=0),
         expand=True,
         content=ft.Column([
-            # 上方滚动区域 (expand=True 占满剩余空间)
             ft.Container(
                 content=page1_scroll_col, 
                 expand=True, 
                 padding=ft.padding.only(top=10, bottom=10)
             ),
-            # 底部固定按钮
             fixed_bottom_action_bar
         ], spacing=0, expand=True) 
     )
@@ -2081,16 +1886,10 @@ async def main(page: ft.Page):
     dot2 = ft.Container(width=10, height=10, border_radius=5, bgcolor="grey", animate=MyAnimation(200, "easeOut") if MyAnimation else None)
     dots_row = ft.Row([dot1, dot2], alignment="center", spacing=8)
 
-    # === 底部导航栏相关 (极简静默版) ===
-    
     nav_btn_menu_icon = ft.Icon("menu", size=24, color="grey")
     nav_btn_menu_text = ft.Text("菜单", size=10, color="grey")
-    
-    # 【改动】这里不再是固定的“设置”，而是动态的“功能按钮”
-    # 默认初始化为“文生图”，后续可以通过代码修改这两个变量来改变图标和文字
     nav_btn_func_icon = ft.Icon("palette", size=24, color="grey")
     nav_btn_func_text = ft.Text("文生图", size=10, color="grey")
-    
     nav_btn_gallery_icon = ft.Icon("image", size=24, color="grey")
     nav_btn_gallery_text = ft.Text("图库", size=10, color="grey")
     
@@ -2122,7 +1921,6 @@ async def main(page: ft.Page):
         )
 
     nav_item_menu = create_nav_item(nav_btn_menu_icon, nav_btn_menu_text, on_menu_btn_click)
-    # 【改动】中间的按钮现在指向 nav_btn_func_...
     nav_item_func = create_nav_item(nav_btn_func_icon, nav_btn_func_text, lambda e: on_nav_click(0))
     nav_item_gallery = create_nav_item(nav_btn_gallery_icon, nav_btn_gallery_text, lambda e: on_nav_click(1))
 
@@ -2133,7 +1931,7 @@ async def main(page: ft.Page):
         border=ft.border.only(top=ft.BorderSide(0.5, "grey")),
         content=ft.Row([
             nav_item_menu,
-            nav_item_func, # 使用新的功能按钮
+            nav_item_func, 
             nav_item_gallery
         ], 
         alignment="start",
@@ -2187,7 +1985,6 @@ async def main(page: ft.Page):
             toggle_sidebar(False)
 
         if index == 0:
-            # 【改动】选中第一页时，高亮中间的功能按钮
             nav_btn_func_icon.color = current_primary_color
             nav_btn_func_text.color = current_primary_color
             nav_btn_gallery_icon.color = "grey"
@@ -2195,13 +1992,11 @@ async def main(page: ft.Page):
             view_switch_btn.icon = "image"
             view_switch_btn.tooltip = "查看生成结果"
         else:
-            # 【改动】选中第二页时，灰显中间的功能按钮
             nav_btn_func_icon.color = "grey"
             nav_btn_func_text.color = "grey"
             nav_btn_gallery_icon.color = current_primary_color
             nav_btn_gallery_text.color = current_primary_color
             view_switch_btn.icon = "tune"
-            # 【改动】动态显示返回文本
             view_switch_btn.tooltip = f"返回{nav_btn_func_text.value}"
             
         nav_item_func.update()
@@ -2239,13 +2034,11 @@ async def main(page: ft.Page):
 
         if not is_wide_mode:
             if open_it:
-                # 【改动】侧边栏打开时，中间按钮变灰
                 nav_btn_func_icon.color = "grey"
                 nav_btn_func_text.color = "grey"
                 nav_btn_gallery_icon.color = "grey"
                 nav_btn_gallery_text.color = "grey"
             else:
-                # 【改动】侧边栏关闭时，根据当前页恢复颜色
                 if t2i_page_index == 0:
                     nav_btn_func_icon.color = current_primary_color
                     nav_btn_func_text.color = current_primary_color
@@ -2260,7 +2053,6 @@ async def main(page: ft.Page):
             nav_item_func.update()
             nav_item_gallery.update()
 
-
     mask = ft.Container(
         bgcolor=get_opacity_color(0.3, "black"),
         left=0, right=0, top=0, bottom=0, 
@@ -2268,31 +2060,24 @@ async def main(page: ft.Page):
         on_click=lambda e: toggle_sidebar(False)
     )
 
-    # ==========================================
-    #      修改后的设置窗口 (自适应高度版)
-    # ==========================================
-
-    # 1. 上方输入框：取消 expand，改用 min_lines 设定一个舒适的默认高度
-    #    max_lines 设为 25，意味着如果内容超过25行，输入框内部会出现滚动条，防止窗口无限变长
     api_keys_field = ft.TextField(
         label="ModelScope Keys (每行一个)", 
         value=stored_api_keys_str, 
         multiline=True, 
-        min_lines=10,  # 默认显示高度：10行 (既不空旷，也够用)
-        max_lines=25,  # 最大高度限制：超过自动内部滚动
+        min_lines=10, 
+        max_lines=25,  
         text_size=12, 
         content_padding=15,
         border_color=get_border_color() 
     )
 
-    # 2. 下方输入框：保持原来的紧凑设计
     baidu_config_field = ft.TextField(
         label="百度翻译配置 (第一行AppID，第二行密钥)", 
         value=stored_baidu_config,
         multiline=True, 
         text_size=12, 
         content_padding=10,
-        height=90,    # 固定高度
+        height=90,    
         border_color=get_border_color()
     )
 
@@ -2307,39 +2092,144 @@ async def main(page: ft.Page):
         current_baidu_appid = lines[0].strip() if len(lines) > 0 else ""
         current_baidu_key = lines[1].strip() if len(lines) > 1 else ""
         
-        # 更新Slider
-        key_count = len(current_api_keys)
-        new_max = max(1, key_count)
-        batch_slider.max = new_max
-        if batch_slider.value > new_max: batch_slider.value = new_max 
-        batch_val_text.value = str(int(batch_slider.value)) 
-        
-        batch_slider.update()
-        batch_val_text.update()
+        is_pm = stored_power_config.get("enabled", False)
+        if not is_pm:
+            key_count = len(current_api_keys)
+            new_max = max(1, key_count)
+            batch_slider.max = new_max
+            if batch_slider.value > new_max: batch_slider.value = new_max 
+            batch_val_text.value = str(int(batch_slider.value)) 
+            batch_slider.update()
+            batch_val_text.update()
+
         safe_close_dialog(settings_dialog)
         page.update()
     
-    # 3. 布局容器：使用 Column 并开启 tight=True (关键：紧缩包裹内容)
-    #    scroll=ft.ScrollMode.AUTO 确保如果屏幕实在太小，整个弹窗可以滚动
     settings_dialog.content = ft.Column(
         controls=[
             api_keys_field, 
             ft.Container(height=15), 
             baidu_config_field
         ], 
-        tight=True,  # 【关键】让窗口高度自适应内容，而不是撑满
-        scroll=ft.ScrollMode.AUTO, # 防止小屏幕手机上显示不全
+        tight=True,  
+        scroll=ft.ScrollMode.AUTO,
         width=300,
         spacing=0
     )
     
     settings_dialog.actions = [ft.TextButton("保存", on_click=save_settings)]
 
-    # ================= 5. 主题选择点击逻辑 =================
-    
+    pm_enabled_switch = ft.Switch(label="启用强力生图", value=False, active_color="amber")
+    pm_batch_slider = ft.Slider(min=1, max=50, divisions=49, label="{value}", value=10, active_color="amber")
+    pm_delay_slider = ft.Slider(min=0.1, max=3.0, divisions=29, label="{value}秒", value=0.2, active_color="amber")
+    pm_keys_container = ft.Column([], spacing=2)
+    pm_limit_field = ft.TextField(label="每日API Key可调用的次数 (仅本地统计)", value="200", keyboard_type="number", text_size=12, height=40, content_padding=10)
+
+    async def save_power_mode_settings(e=None):
+        nonlocal stored_power_config
+        selected_keys_list = []
+        for chk in pm_keys_container.controls:
+            if isinstance(chk, ft.Checkbox) and chk.value:
+                if chk.data: selected_keys_list.append(chk.data.strip())
+        
+        try: daily_limit = int(pm_limit_field.value)
+        except: daily_limit = 200
+
+        new_power_config = {
+            "enabled": pm_enabled_switch.value,
+            "batch_size": int(pm_batch_slider.value),
+            "selected_keys": selected_keys_list,
+            "daily_limit": daily_limit,
+            "request_delay": float(pm_delay_slider.value)
+        }
+        
+        await save_config("power_mode_config", new_power_config)
+        stored_power_config = new_power_config
+        
+        if new_power_config["enabled"]:
+            new_max = int(new_power_config["batch_size"])
+            new_max = max(1, new_max)
+            batch_slider.max = new_max
+            batch_slider.label = "{value} ⚡"
+            batch_slider.active_color = "red"
+            batch_row.controls[0].value = "⚡ 强力"
+            batch_row.controls[0].color = "red"
+            batch_row.controls[0].weight = "bold"
+        else:
+            key_count = len(current_api_keys)
+            new_max = max(1, key_count)
+            batch_slider.max = new_max
+            batch_slider.label = "{value}"
+            batch_slider.active_color = current_primary_color
+            batch_row.controls[0].value = "生图数量"
+            batch_row.controls[0].color = "grey"
+            batch_row.controls[0].weight = "normal"
+            
+        if batch_slider.value > batch_slider.max: batch_slider.value = batch_slider.max
+        batch_val_text.value = str(int(batch_slider.value))
+        
+        safe_close_dialog(power_mode_dialog)
+        page.snack_bar = ft.SnackBar(ft.Text("强力模式配置已保存"), open=True)
+        page.update()
+
+    async def _init_power_mode_ui():
+        pm_enabled_switch.value = stored_power_config.get("enabled", False)
+        pm_batch_slider.value = float(stored_power_config.get("batch_size", 10))
+        pm_delay_slider.value = float(stored_power_config.get("request_delay", 0.2))
+        pm_limit_field.value = str(stored_power_config.get("daily_limit", 200))
+        saved_selected = [k.strip() for k in stored_power_config.get("selected_keys", []) if k]
+        
+        controls_list = []
+        
+        if not current_api_keys:
+            controls_list.append(ft.Text("请先在 API Key 设置中添加 Key", color="red", size=12))
+        else:
+            for idx, raw_k in enumerate(current_api_keys):
+                k = raw_k.strip() 
+                if not k: continue
+                is_checked = False
+                if not saved_selected: is_checked = True 
+                else: is_checked = (k in saved_selected)
+                chk = ft.Checkbox(label=f"Key {idx+1}", value=is_checked, data=k)
+                controls_list.append(chk)
+        
+        pm_keys_container.controls = controls_list
+        power_mode_dialog.content.update()
+
+    def open_power_mode_dialog(e):
+        power_mode_dialog.content = ft.Container(
+            width=320,
+            content=ft.Column([
+                ft.Container(height=10),
+                pm_enabled_switch,
+                ft.Container(height=10),
+                ft.Text("您一次想生成的图片数量:", size=12),
+                pm_batch_slider,
+                ft.Container(height=5),
+                ft.Text("任务创建间隔 (防止QPS超限):", size=12),
+                pm_delay_slider,
+                ft.Divider(height=20, thickness=0.5),
+                ft.Text("配置 API Key:", size=12),
+                ft.Container(
+                    content=pm_keys_container,
+                    height=150, 
+                    border=ft.border.all(1, get_border_color()),
+                    border_radius=5,
+                    padding=10,
+                ), 
+                ft.Container(height=10),
+                pm_limit_field,
+            ], tight=True, scroll=ft.ScrollMode.AUTO)
+        )
+        pm_keys_container.scroll = ft.ScrollMode.AUTO
+        power_mode_dialog.actions = [
+            ft.TextButton("取消", on_click=lambda e: safe_close_dialog(power_mode_dialog)),
+            ft.ElevatedButton("保存", on_click=lambda e: page.run_task(save_power_mode_settings), bgcolor="amber", color="black")
+        ]
+        safe_open_dialog(power_mode_dialog)
+        page.run_task(_init_power_mode_ui)
+
     def open_settings_dialog(e):
-        # 【关键修改】删除所有高度计算代码
-        # 直接打开，让 settings_dialog 自己的 tight=True 属性去决定高度
         safe_open_dialog(settings_dialog)
 
     def build_theme_content():
@@ -2384,6 +2274,8 @@ async def main(page: ft.Page):
     sidebar_theme_text = ft.Text("主题设置", color="grey", size=16)
     sidebar_key_icon = ft.Icon("vpn_key", color="grey", size=24)
     sidebar_key_text = ft.Text("Api_key", color="grey", size=16)
+    sidebar_power_icon = ft.Icon("flash_on", color="grey", size=24)
+    sidebar_power_text = ft.Text("强力生图模式", color="grey", size=16)
 
     async def update_theme(mode=None, color_name=None):
         nonlocal current_primary_color, stored_mode
@@ -2408,7 +2300,14 @@ async def main(page: ft.Page):
             
             sidebar_theme_icon.color = "grey" 
             
-            batch_slider.active_color = hex_val
+            is_pm = stored_power_config.get("enabled", False)
+            if not is_pm:
+                batch_slider.active_color = hex_val
+                batch_row.controls[0].color = "grey"
+            else:
+                batch_slider.active_color = "red"
+                batch_row.controls[0].color = "red"
+            
             steps_slider.active_color = hex_val
             guidance_slider.active_color = hex_val
             custom_model_btn.color = hex_val
@@ -2422,23 +2321,14 @@ async def main(page: ft.Page):
             update_dots()
             switch_t2i_page(t2i_page_index)
 
-            # 更新缩略图卡片颜色
             for card in results_grid.controls:
                 try:
                     stack = card.content
-                    
-                    # --- 🎨 新增：更新 Loading 区域颜色 ---
-                    # 以前这里直接获取 status_text，现在这里是一个包含 Ring 和 Text 的 Column
                     loading_bg_container = stack.controls[0] 
-                    
-                    # 检查是否为新结构 (Column)
                     if isinstance(loading_bg_container.content, ft.Column):
                         loading_col = loading_bg_container.content
-                        # loading_col.controls[0] 是 ProgressRing
-                        # loading_col.controls[2] 是 Text
                         loading_col.controls[0].color = hex_val 
                         loading_col.controls[2].color = hex_val
-                    # -----------------------------------
                     
                     meta_overlay = stack.controls[2]
                     meta_col = meta_overlay.content
@@ -2461,7 +2351,6 @@ async def main(page: ft.Page):
             
             results_grid.update()
 
-            # 更新查看器按钮颜色
             for btn in viewer_control_btns:
                 btn.icon_color = hex_val
                 try: btn.update()
@@ -2485,15 +2374,13 @@ async def main(page: ft.Page):
             try: viewer_info_container.update()
             except: pass
             
-            # 更新下载按钮颜色
             viewer_dl_btn.icon_color = hex_val
             btn_browser_dl.icon_color = hex_val
             try: viewer_dl_btn.update()
             except: pass
             try: btn_browser_dl.update()
-            except: pass  # 补全这个 except
+            except: pass 
             
-            # 更新提示胶囊颜色
             zoom_hint_container.bgcolor = get_opacity_color(0.7, hex_val)
             try: zoom_hint_container.update()
             except: pass
@@ -2560,6 +2447,7 @@ async def main(page: ft.Page):
             custom_model_dialog.bgcolor = dialog_bg
             custom_size_dialog.bgcolor = dialog_bg
             gallery_popup_menu.bgcolor = dialog_bg 
+            power_mode_dialog.bgcolor = dialog_bg
 
             bottom_nav_content.bgcolor = sidebar_bg
             
@@ -2592,6 +2480,13 @@ async def main(page: ft.Page):
         on_click=open_settings_dialog,
         ink=True
     )
+    
+    sidebar_power_item = ft.Container(
+        content=ft.Row([sidebar_power_icon, ft.Container(width=10), sidebar_power_text]),
+        padding=ft.padding.symmetric(vertical=15, horizontal=20),
+        on_click=open_power_mode_dialog,
+        ink=True
+    )
 
     sidebar_drag_buffer = 0
 
@@ -2617,6 +2512,7 @@ async def main(page: ft.Page):
             sidebar_div2,
             ft.Column([
                 sidebar_theme_item,
+                sidebar_power_item,
                 sidebar_key_item
             ], spacing=0)
         ], expand=True)
@@ -2680,11 +2576,9 @@ async def main(page: ft.Page):
         gallery_control_btn_container.content = gallery_popup_menu
     
     def on_gallery_btn_pan(e: ft.DragUpdateEvent):
-        # 1. 基础宽高获取 (强制转 float)
         safe_w = float(page.width) if page.width else 360.0
         safe_h = float(page.height) if page.height else 640.0
 
-        # 2. 计算左侧边界
         sidebar_w = 0
         if is_wide_mode:
              sidebar_w = 300 
@@ -2694,24 +2588,16 @@ async def main(page: ft.Page):
         min_left = sidebar_w + 10 
         max_left = safe_w - 60    
 
-        # ==========================================
-        #      【核心修复】更强壮的类型转换逻辑
-        # ==========================================
-        
-        # --- 处理 Left (横向) ---
         raw_left = gallery_control_gesture.left
-        # 如果是 None 或者 空字符串，说明还没拖动过，还在默认位置(右侧)
         if raw_left is None or raw_left == "":
             current_left = float(max_left - 20) 
-            gallery_control_gesture.right = None # 开始拖动后，清除 right 定位，改为 left 定位
+            gallery_control_gesture.right = None 
         else:
             try:
                 current_left = float(raw_left)
             except ValueError:
-                #以此防止万一出现的其他奇怪字符
                 current_left = float(max_left - 20)
 
-        # --- 处理 Bottom (纵向) ---
         raw_bottom = gallery_control_gesture.bottom
         if raw_bottom is None or raw_bottom == "":
             current_bottom = 100.0
@@ -2721,11 +2607,9 @@ async def main(page: ft.Page):
             except ValueError:
                 current_bottom = 100.0
 
-        # 3. 计算新坐标
         new_left = current_left + e.delta_x
         new_bottom = current_bottom - e.delta_y 
 
-        # 4. 边界限制
         if new_left < min_left: new_left = min_left
         if new_left > max_left: new_left = max_left
 
@@ -2735,7 +2619,6 @@ async def main(page: ft.Page):
         if new_bottom < min_bottom: new_bottom = min_bottom
         if new_bottom > max_bottom: new_bottom = max_bottom
 
-        # 5. 更新位置
         gallery_control_gesture.left = new_left
         gallery_control_gesture.bottom = new_bottom
         gallery_control_gesture.update()
@@ -2749,16 +2632,10 @@ async def main(page: ft.Page):
         visible=False 
     )
 
-    # ==========================================
-    #      【核心逻辑】响应式布局调整
-    # ==========================================
     def on_resize(e):
         nonlocal is_wide_mode
-        # 给一个默认值（例如 390x844），确保即使 page.width 还没准备好，也能按手机模式渲染
         pw = page.width if page.width else 390 
         ph = page.height if page.height else 844
-
-        # 删除 if pw == 0 return 这一句，强制执行后续布局逻辑
 
         new_is_wide = (pw > ph and pw > 600)
         mode_changed = (new_is_wide != is_wide_mode)
@@ -2796,9 +2673,6 @@ async def main(page: ft.Page):
             try: btn_browser_dl.update()
             except: pass
 
-        # -----------------------------------------------
-        # 常规布局调整
-        # -----------------------------------------------
         if is_wide_mode:
             t2i_slider.offset = MyOffset(0, 0)
             
@@ -2829,7 +2703,6 @@ async def main(page: ft.Page):
             results_grid.max_extent = 300
             results_grid.runs_count = None 
             
-            # 【关键修改】无论宽屏还是竖屏，都允许自动滚动
             page1_scroll_col.scroll = ft.ScrollMode.AUTO 
             
             custom_appbar.height = 50
@@ -2864,7 +2737,6 @@ async def main(page: ft.Page):
             results_grid.max_extent = 160
             results_grid.runs_count = None 
             
-            # 【关键修改】保持自动滚动
             page1_scroll_col.scroll = ft.ScrollMode.AUTO 
             
             fixed_bottom_action_bar.visible = True
@@ -2923,14 +2795,10 @@ async def main(page: ft.Page):
         ], alignment="start")
     )
 
-    # ==========================================
-    #      修改点：使用 SafeArea 包裹主内容
-    # ==========================================
     main_content_bg = ft.Container(
         expand=True, 
         bgcolor=BG_LIGHT, 
         padding=0,
-        # 这里加入了 ft.SafeArea，它是处理刘海屏和底部横条的专业方案
         content=ft.SafeArea(
             content=ft.Column([
                 custom_appbar,
@@ -2938,15 +2806,14 @@ async def main(page: ft.Page):
                 ft.Container(content=dots_row, height=0 if not is_wide_mode else 35, alignment=ft.alignment.center),
                 bottom_nav 
             ], spacing=0),
-            bottom=True, # 自动避开底部横条
-            top=True     # 自动避开顶部刘海/状态栏
+            bottom=True, 
+            top=True     
         )
     )
     
     layout = ft.Stack([main_content_bg, mask, sidebar_container, viewer_overlay, gallery_control_gesture], expand=True)
     page.add(layout)
 
-    # 1. ⭐️ 添加后立即手动触发一次 resize，让布局瞬间归位
     on_resize(None) 
     
     nav_container_ref.content = ft.Row([
@@ -2957,22 +2824,30 @@ async def main(page: ft.Page):
     
     switch_t2i_page(0) 
     
-    # 2. ⭐️ 确保 on_resize 后立即 update 一次，让用户第一眼看到的就是正确的
     page.update() 
 
     await update_theme(stored_mode, stored_color_name)
     update_upload_area()
     
-    # 3. ⭐️ 这里的 sleep 只用于文字的视觉延迟效果，不应该阻挡布局
-    # (此时布局已经是正常的了，用户等待时看到的是正常的界面)
     await asyncio.sleep(0.5) 
     
-    # 4. 更新文字
     nav_text_ref.value = "  图片编辑"
     nav_btn_func_text.value = "图片编辑"
     view_switch_btn.tooltip = "查看编辑结果"
     
-    # 5. 最后再刷新一次
+    is_pm = stored_power_config.get("enabled", False)
+    if is_pm:
+        new_max = int(stored_power_config.get("batch_size", 10))
+        new_max = max(1, new_max)
+        batch_slider.max = new_max
+        batch_slider.label = "{value} ⚡"
+        batch_slider.active_color = "red"
+        batch_row.controls[0].value = "⚡ 强力"
+        batch_row.controls[0].color = "red"
+        batch_row.controls[0].weight = "bold"
+        if batch_slider.value > new_max: batch_slider.value = new_max
+        batch_val_text.value = str(int(batch_slider.value))
+    
     page.update()
 
     if not current_api_keys:
