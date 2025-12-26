@@ -87,14 +87,24 @@ threading.Thread(target=start_local_server, daemon=True).start()
 # ==========================================
 BASE_URL = 'https://api-inference.modelscope.cn/'
 BAIDU_TRANSLATE_URL = 'https://fanyi-api.baidu.com/api/trans/vip/translate'
-T2I_FOLDER = "T2I"
+I2I_FOLDER = "I2I_Edits"
 
-if not os.path.exists(T2I_FOLDER):
-    try: os.makedirs(T2I_FOLDER)
+if not os.path.exists(I2I_FOLDER):
+    try: os.makedirs(I2I_FOLDER)
     except: pass
 
-MORANDI_COLORS = {
-    "Red": "#C85C56", "Orange": "#D98656", "Gold": "#D0A467", "Green": "#709D78",
+# ⭐️ 支持多图上传的模型列表
+MODELS_REQUIRING_LIST_INPUT = [
+    'Qwen/Qwen-Image-Edit-2509',
+    'black-forest-labs/FLUX.2-dev',
+]
+
+downloaded_urls = set()
+
+# ⭐️ 智能上传缓存：{ file_path: uploaded_url }
+file_upload_cache = {}
+
+MORANDI_COLORS = {    "Red": "#C85C56", "Orange": "#D98656", "Gold": "#D0A467", "Green": "#709D78",
     "Teal": "#5C969C", "Blue": "#5D7EA8", "Purple": "#8C73A6"
 }
 
@@ -118,15 +128,15 @@ CUSTOM_BTN_WIDTH = 68
 SEARCH_WIDTH = 70 
 
 DEFAULT_MODEL_OPTIONS = [
-    {"key": "Tongyi-MAI/Z-Image-Turbo", "text": "造相-Z-Image-Turbo"},
+    {"key": "Qwen/Qwen-Image-Edit-2509", "text": "Qwen-Image-Edit-2509"},
     {"key": "black-forest-labs/FLUX.2-dev", "text": "FLUX.2-dev"},
-    {"key": "Qwen/Qwen-Image", "text": "Qwen-Image"},
-    {"key": "Qwen/Qwen-Image-Edit", "text": "Qwen-Image-Edit"},
-    {"key": "black-forest-labs/FLUX.1-Krea-dev", "text": "FLUX.1-Krea-dev"},
+    {"key": "Qwen/Qwen-Image-Edit", "text": "Qwen/Qwen-Image-Edit (默认)"},
     {"key": "MusePublic/FLUX.1-Kontext-Dev", "text": "FLUX.1-Kontext-Dev"},
+    {"key": "google/gemini-2.0-flash-exp", "text": "Gemini 2.0 Flash (Google)"},
 ]
 
 SIZE_OPTIONS = [
+    {"key": "AutoSize", "text": "AutoSize (自动检测)"},
     {"key": "928x1664", "text": "928x1664 (竖屏)"},
     {"key": "1104x1472", "text": "1104x1472 (竖屏)"},
     {"key": "1328x1328", "text": "1328x1328 (方形)"},
@@ -134,7 +144,6 @@ SIZE_OPTIONS = [
     {"key": "1664x928", "text": "1664x928 (横屏)"},
     {"key": "2048x2048", "text": "2048x2048 (方形)"},
 ]
-
 # ==========================================
 #      辅助工具函数
 # ==========================================
@@ -237,6 +246,61 @@ def extract_metadata_from_png(image_bytes):
         return None
 
 # ==========================================
+#      【新增】图片编辑专用工具函数
+# ==========================================
+
+def get_image_size(file_path):
+    """简单的获取图片宽高函数，用于AutoSize逻辑"""
+    try:
+        with open(file_path, 'rb') as f:
+            head = f.read(24)
+            if len(head) != 24: return None
+            if head.startswith(b'\x89PNG\r\n\x1a\n'):
+                w, h = struct.unpack('>II', head[16:24])
+                return w, h
+            elif head.startswith(b'\xff\xd8'):
+                f.seek(0)
+                ftype = 0
+                while True:
+                    byte = f.read(1)
+                    if not byte: break
+                    if byte == b'\xff':
+                        byte = f.read(1)
+                        if not byte: break
+                        if byte[0] >= 0xc0 and byte[0] <= 0xcf and byte[0] != 0xc4 and byte[0] != 0xc8 and byte[0] != 0xcc:
+                            f.read(3)
+                            h, w = struct.unpack('>HH', f.read(4))
+                            return w, h
+                        else:
+                            f.read(int.from_bytes(f.read(2), 'big') - 2)
+    except:
+        return None
+    return None
+
+async def upload_image_to_host(file_path):
+    # ⭐️ 智能复用：先检查缓存
+    if file_path in file_upload_cache:
+        print(f"Reuse cached URL for: {file_path}")
+        return file_upload_cache[file_path]
+
+    try:
+        filename = os.path.basename(file_path)
+        with open(file_path, 'rb') as f:
+            files = {'files[]': (filename, f, 'image/png')}
+            res = await asyncio.to_thread(requests.post, "https://uguu.se/upload", files=files, timeout=60)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get('success'):
+                url = data['files'][0]['url']
+                # ⭐️ 存入缓存
+                file_upload_cache[file_path] = url
+                return url
+        return None
+    except Exception as e:
+        print(f"Upload failed: {e}")
+        return None
+
+# ==========================================
 #             Main Application
 # ==========================================
 
@@ -245,8 +309,11 @@ async def main(page: ft.Page):
     page.window.min_width = 380
     page.window.min_height = 600
     page.window.resizable = True   
-    page.title = "魔塔AI大全"
+    page.title = "魔塔AI大全 - 图片编辑"
     page.padding = 0
+    
+    # ⭐️ 初始化上传列表
+    uploaded_files = []
     page.spacing = 0
     page.appbar = None 
     try: page.expand = True 
@@ -1289,6 +1356,10 @@ async def main(page: ft.Page):
         else: model_dropdown.value = None
         model_dropdown.update()
 
+    # --- 模型下拉菜单相关逻辑 ---
+    def on_model_change(e):
+        update_upload_area()
+
     model_search_field = ft.TextField(
         hint_text="搜索...", text_size=12, height=INPUT_HEIGHT,
         content_padding=ft.padding.symmetric(horizontal=10, vertical=0), border_radius=8, bgcolor="transparent",
@@ -1297,9 +1368,11 @@ async def main(page: ft.Page):
 
     model_dropdown = ft.Dropdown(
         options=[ft.dropdown.Option(m["key"], m["text"]) for m in get_all_models()],
-        value=DEFAULT_MODEL_OPTIONS[0]["key"], text_size=14, content_padding=ft.padding.only(left=10, right=10, bottom=5),
+        value=DEFAULT_MODEL_OPTIONS[2]["key"], # 默认选中第3个
+        text_size=14, content_padding=ft.padding.only(left=10, right=10, bottom=5),
         border_color="transparent", border_width=0, fill_color=get_dropdown_bgcolor(), bgcolor=get_dropdown_fill_color(),
-        focused_bgcolor=ft.Colors.TRANSPARENT, expand=True 
+        focused_bgcolor=ft.Colors.TRANSPARENT, expand=True,
+        on_change=on_model_change # ⭐️ 绑定变更事件
     )
     
     model_dropdown_container = ft.Container(content=model_dropdown, height=INPUT_HEIGHT, border=ft.border.all(1, get_border_color()), border_radius=8, expand=True, alignment=ft.alignment.center_left)
@@ -1331,113 +1404,128 @@ async def main(page: ft.Page):
     async def on_prompt_blur(e): await hide_prompt_actions(e, prompt_trans_row)
     async def on_neg_blur(e): await hide_prompt_actions(e, neg_trans_row)
 
-    def apply_metadata_to_ui(meta):
-        if not meta: return
-        count = 0
-        if "prompt" in meta: 
-            prompt_input.value = meta["prompt"]
-            count += 1
-        if "negative_prompt" in meta: neg_prompt_input.value = meta["negative_prompt"]
-        if "seed" in meta: seed_input.value = str(meta["seed"])
-        if "num_inference_steps" in meta: 
-            steps_slider.value = float(meta["num_inference_steps"])
-            steps_val_text.value = str(meta["num_inference_steps"])
-        if "guidance_scale" in meta:
-            guidance_slider.value = float(meta["guidance_scale"])
-            guidance_val_text.value = str(meta["guidance_scale"])
-        if "model" in meta:
-            matched_model = False
-            for opt in model_dropdown.options:
-                if opt.key == meta["model"]:
-                    model_dropdown.value = meta["model"]
-                    matched_model = True
-                    break
-            if not matched_model:
-                model_dropdown.options.insert(0, ft.dropdown.Option(meta["model"], meta["model"] + " (Meta)"))
-                model_dropdown.value = meta["model"]
-        if "size" in meta: size_dropdown.value = meta["size"]
+    # ==========================================
+    #      ⭐️【新增】上传区域逻辑与UI
+    # ==========================================
+    upload_content_container = ft.Container()
 
-        prompt_input.update()
-        neg_prompt_input.update()
-        seed_input.update()
-        steps_slider.update()
-        steps_val_text.update()
-        guidance_slider.update()
-        guidance_val_text.update()
-        model_dropdown.update()
-        size_dropdown.update()
+    def remove_image(idx):
+        if 0 <= idx < len(uploaded_files):
+            uploaded_files.pop(idx)
+            update_upload_area()
+
+    def update_upload_area():
+        # 判断当前模型是否支持多图
+        is_multi_mode = model_dropdown.value in MODELS_REQUIRING_LIST_INPUT
         
-        if count > 0:
-            page.snack_bar = ft.SnackBar(ft.Text("成功读取元数据"), open=True)
-            page.update()
-        else:
-            page.snack_bar = ft.SnackBar(ft.Text("图片中未发现有效元数据"), open=True)
-            page.update()
+        placeholder = ft.Column([
+            ft.Icon("cloud_upload", size=30, color="grey"),
+            ft.Text("点击上传图片 (自动读取元数据)", size=12, color="grey"),
+            ft.Text("支持多图模式" if is_multi_mode else "单图模式", size=10, color="grey")
+        ], alignment="center", horizontal_alignment="center", spacing=2)
 
-    def apply_metadata_from_path(file_path):
-        try:
-            with open(file_path, "rb") as f: img_bytes = f.read()
-            meta = extract_metadata_from_png(img_bytes)
-            if meta: apply_metadata_to_ui(meta)
-            else:
-                 page.snack_bar = ft.SnackBar(ft.Text("该图片未包含可识别的元数据"), open=True)
-                 page.update()
-        except Exception as ex:
-            page.snack_bar = ft.SnackBar(ft.Text(f"读取失败: {ex}"), open=True)
-            page.update()
-
-    def process_clipboard_metadata(e=None):
-        if not HAS_PIL_GRAB:
-            page.snack_bar = ft.SnackBar(ft.Text("当前设备不支持读取剪贴板图片"), open=True)
-            page.update()
+        if not uploaded_files:
+            upload_content_container.content = ft.Container(
+                content=placeholder, 
+                alignment=ft.alignment.center,
+                on_click=lambda _: upload_file_picker.pick_files(
+                    allow_multiple=is_multi_mode, 
+                    allowed_extensions=["png", "jpg", "jpeg", "webp"]
+                )
+            )
+            upload_content_container.update()
             return
-        try:
-            content = ImageGrab.grabclipboard()
-            meta = None
-            found_something = False
-            if isinstance(content, list):
-                for path in content:
-                    if path.lower().endswith('.png'):
-                        found_something = True
-                        with open(path, "rb") as f: img_bytes = f.read()
-                        meta = extract_metadata_from_png(img_bytes)
-                        if meta: break
-            elif content: found_something = True
-                
-            if meta: apply_metadata_to_ui(meta)
+
+        if not is_multi_mode:
+            # 单图模式显示
+            file_path = uploaded_files[0]
+            img_view = ft.Image(src=file_path, fit=ft.ImageFit.CONTAIN, border_radius=8)
+            clear_btn = ft.Container(
+                content=ft.IconButton(icon="close", icon_size=20, icon_color="red", on_click=lambda e: remove_image(0)),
+                top=5, right=5
+            )
+            upload_content_container.content = ft.Stack([
+                ft.Container(content=img_view, padding=5, alignment=ft.alignment.center),
+                clear_btn
+            ])
+            # 点击图片也可以重新上传
+            upload_content_container.on_click = lambda _: upload_file_picker.pick_files(allow_multiple=False, allowed_extensions=["png", "jpg", "jpeg", "webp"])
+        else:
+            # 多图模式显示
+            thumbs = []
+            for i, path in enumerate(uploaded_files):
+                img_thumb = ft.Image(src=path, fit=ft.ImageFit.COVER, width=100, height=100, border_radius=8)
+                rm_btn = ft.Container(
+                    content=ft.IconButton(icon="close", icon_size=16, icon_color="white", on_click=lambda e, idx=i: remove_image(idx)),
+                    bgcolor="#88000000", border_radius=15, width=24, height=24, top=2, right=2
+                )
+                thumb_container = ft.Container(
+                    width=100, height=100,
+                    content=ft.Stack([img_thumb, rm_btn]),
+                    border=ft.border.all(1, get_border_color()),
+                    border_radius=8
+                )
+                thumbs.append(thumb_container)
+
+            add_btn = ft.Container(
+                width=100, height=100,
+                border=ft.border.all(1, get_border_color()),
+                border_radius=8,
+                bgcolor=get_opacity_color(0.1, current_primary_color),
+                alignment=ft.alignment.center,
+                content=ft.Icon("add", size=30, color="grey"),
+                on_click=lambda _: upload_file_picker.pick_files(allow_multiple=True, allowed_extensions=["png", "jpg", "jpeg", "webp"])
+            )
+            thumbs.append(add_btn)
+            
+            upload_content_container.content = ft.Row(
+                thumbs, scroll=ft.ScrollMode.AUTO, spacing=10, alignment="start"
+            )
+            upload_content_container.on_click = None
+
+        upload_content_container.update()
+
+    def on_upload_file_picked(e: ft.FilePickerResultEvent):
+        if e.files:
+            is_multi = model_dropdown.value in MODELS_REQUIRING_LIST_INPUT
+            new_paths = [f.path for f in e.files]
+            
+            if is_multi:
+                uploaded_files.extend(new_paths)
             else:
-                if not found_something: page.snack_bar = ft.SnackBar(ft.Text("剪贴板中没有图片或图片文件"), open=True)
-                else: page.snack_bar = ft.SnackBar(ft.Text("剪贴板图片中未找到元数据 (请尝试复制文件而非图片内容)"), open=True)
-                page.update()
-        except Exception as ex:
-            page.snack_bar = ft.SnackBar(ft.Text(f"读取剪贴板失败: {ex}"), open=True)
-            page.update()
+                uploaded_files.clear()
+                uploaded_files.append(new_paths[0])
+            
+            # 读取最后一张图的元数据
+            if new_paths:
+                apply_metadata_from_path(new_paths[-1])
+            update_upload_area()
 
-    def on_keyboard(e: ft.KeyboardEvent):
-        if e.ctrl and e.key.lower() == "v":
-            if HAS_PIL_GRAB:
-                try:
-                    check = ImageGrab.grabclipboard()
-                    if check is not None: process_clipboard_metadata()
-                except: pass
-    
-    page.on_keyboard_event = on_keyboard
+    upload_file_picker = ft.FilePicker(on_result=on_upload_file_picked)
+    page.overlay.append(upload_file_picker)
 
-    def on_meta_file_picked(e: ft.FilePickerResultEvent):
-        if e.files: apply_metadata_from_path(e.files[0].path)
+    upload_container = ft.Container(
+        content=upload_content_container,
+        height=140,
+        border=ft.border.all(1, get_border_color()),
+        border_radius=10,
+        bgcolor=get_dropdown_bgcolor(),
+        padding=10,
+        animate=MyAnimation(300, "easeOut") if MyAnimation else None
+    )
 
-    meta_file_picker = ft.FilePicker(on_result=on_meta_file_picked)
+    meta_file_picker = ft.FilePicker(on_result=lambda e: apply_metadata_from_path(e.files[0].path) if e.files else None)
     page.overlay.append(meta_file_picker)
 
+    # ⭐️ 修改了 hint_text
     prompt_input = ft.TextField(
-        hint_text="正面提示词 (支持粘贴带元数据图片)...", multiline=True, expand=True, text_size=13, bgcolor="transparent", 
+        hint_text="编辑指令 (例如: 把衣服改成红色)...", multiline=True, expand=True, text_size=13, bgcolor="transparent", 
         filled=False, border=ft.InputBorder.NONE, content_padding=ft.padding.only(left=10, top=10, right=10, bottom=32),
         on_focus=lambda e: show_prompt_actions(e, prompt_trans_row), on_blur=on_prompt_blur,
     )
     
     prompt_trans_row = ft.Row(
         [
-         ft.IconButton("content_paste", icon_size=16, tooltip="读取剪贴板元数据", on_click=process_clipboard_metadata),
          ft.IconButton("folder_open", icon_size=16, tooltip="读取元数据文件", on_click=lambda _: meta_file_picker.pick_files(allow_multiple=False, allowed_extensions=["png"])),
          ft.IconButton("language", icon_size=16, tooltip="转英文", on_click=lambda e: handle_translate(e, prompt_input, "en")),
          ft.IconButton("translate", icon_size=16, tooltip="转中文", on_click=lambda e: handle_translate(e, prompt_input, "zh"))
@@ -1467,7 +1555,7 @@ async def main(page: ft.Page):
     )
 
     size_dropdown = ft.Dropdown(
-        options=[ft.dropdown.Option(s["key"], s["text"]) for s in SIZE_OPTIONS], value=SIZE_OPTIONS[0]["key"],
+        options=[ft.dropdown.Option(s["key"], s["text"]) for s in SIZE_OPTIONS], value="AutoSize", # 默认 AutoSize
         text_size=14, content_padding=ft.padding.only(left=10, right=10, bottom=5), border_color="transparent", border_width=0,
         fill_color=get_dropdown_bgcolor(), bgcolor=get_dropdown_fill_color(), focused_bgcolor=ft.Colors.TRANSPARENT, expand=True
     )
@@ -1509,12 +1597,9 @@ async def main(page: ft.Page):
     size_row = ft.Row([size_dropdown_container, custom_size_btn], spacing=5)
 
     def create_slider_row(label, min_v, max_v, def_v, step=1):
-        # nb_divisions = int((max_v - min_v) / step) # 【已注释】不再计算分段，从而隐藏刻度点
-
         slider = ft.Slider(
             min=min_v, 
             max=max_v, 
-            # divisions=nb_divisions, # 【已注释】去掉此行，从而隐藏滑块背后的圆点
             value=def_v, 
             label="{value}", 
             expand=True, 
@@ -1524,19 +1609,12 @@ async def main(page: ft.Page):
         val_text = ft.Text(str(def_v), width=40, size=14, text_align="center")
 
         def on_change(e):
-            # === 【核心修复逻辑】 ===
-            # 虽然滑块是平滑的，但我们在显示时手动算回最近的步进值
-            # 算法：(当前值 / 步长) 四舍五入取整 * 步长
             raw_val = e.control.value
             snapped_val = round(raw_val / step) * step
-            
             if step < 1:
-                # 如果是小数步进（如引导系数 0.5），保留一位小数
                 val_text.value = f"{snapped_val:.1f}"
             else:
-                # 如果是整数步进（如步数 1），直接转整数
                 val_text.value = str(int(snapped_val))
-                
             val_text.update()
             
         slider.on_change = on_change
@@ -1566,40 +1644,20 @@ async def main(page: ft.Page):
     )
     seed_row = ft.Row([ft.Text("随机种子", size=14, width=60, color="grey"), seed_input], alignment="center", vertical_alignment="center")
 
+    # ⭐️ 修改了文本和图标
     generate_btn = ft.ElevatedButton(
-        "开始生成", icon="brush", bgcolor=current_primary_color, color="white", height=50, style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)), width=float("inf")
+        "开始编辑", icon="auto_fix_high", bgcolor=current_primary_color, color="white", height=50, style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=12)), width=float("inf")
     )
 
     results_grid = ft.GridView(expand=True, runs_count=None, max_extent=350, child_aspect_ratio=1.0, spacing=10, run_spacing=10, padding=10)
     
-    # ================= 5. 结果卡片 UI (修改版 - 带Loading动画) =================
+    # ================= 5. 结果卡片 UI (修改版) =================
     
     def create_result_card_ui(index):
         img = ft.Image(src="", fit=ft.ImageFit.CONTAIN, visible=False, expand=True, animate_opacity=300, border_radius=10)
         img.is_downloaded = False # 初始化标记
         
-        # --- 🎨 新增：加载动画组件 ---
-        # 1. 定义圆圈动画 (颜色跟随当前主题)
-        loading_ring = ft.ProgressRing(width=25, height=25, stroke_width=3, color=current_primary_color)
-        
-        # 2. 定义状态文字 (颜色跟随当前主题，稍微缩小一点字号显得精致)
-        status_text = ft.Text(f"排队中...", size=11, color=current_primary_color, text_align="center")
-        
-        # 3. 将它们垂直排列
-        # 将 ring 绑定到 text 对象上，方便后续逻辑函数调用
-        status_text.associated_ring = loading_ring 
-
-        loading_col = ft.Column(
-            controls=[
-                loading_ring,
-                ft.Container(height=5), # 间距
-                status_text
-            ],
-            alignment=ft.MainAxisAlignment.CENTER,
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            spacing=0
-        )
-
+        status = ft.Text(f"排队中...", size=12, color="grey", text_align="center")
         overlay_prompt = ft.Text("", size=11, color=current_primary_color, selectable=True)
         overlay_neg = ft.Text("", size=11, color=current_primary_color, selectable=True)
         
@@ -1663,16 +1721,14 @@ async def main(page: ft.Page):
         
         img_container = ft.Container(content=img, expand=True, border_radius=10, on_click=lambda e: show_image_viewer(img.src) if img.src else None)
         action_bar = ft.Row([btn_info, btn_browser, btn_dl], alignment="end", spacing=0)
-        
-        # ⭐️ 布局修改：底层容器现在 content 是 loading_col
         card_stack = ft.Stack([
-            ft.Container(content=loading_col, alignment=ft.alignment.center, bgcolor=get_opacity_color(0.05, "black"), border_radius=10, expand=True),
+            ft.Container(content=status, alignment=ft.alignment.center, bgcolor=get_opacity_color(0.05, "black"), border_radius=10, expand=True),
             img_container, meta_overlay, ft.Container(content=action_bar, right=0, bottom=0) 
         ], expand=True)
 
         card = ft.Container(content=card_stack, bgcolor="transparent", border_radius=10, clip_behavior=ft.ClipBehavior.HARD_EDGE)
 
-        return card, img, status_text, btn_dl, btn_info, btn_browser
+        return card, img, status, btn_dl, btn_info, btn_browser
 
     async def run_gen(e):
         if is_wide_mode and left_panel_visible: toggle_left_panel(None)
@@ -1682,26 +1738,82 @@ async def main(page: ft.Page):
         if not keys:
             safe_open_dialog(settings_dialog)
             return
-        if not prompt_input.value:
-            page.snack_bar = ft.SnackBar(ft.Text("请输入提示词"), open=True)
+        
+        if not uploaded_files:
+            page.snack_bar = ft.SnackBar(ft.Text("请先上传一张图片"), open=True)
             page.update()
             return
 
-        size_str = size_dropdown.value
-        try:
-            w_str, h_str = size_str.split()[0].split('x')
-            aspect_ratio = float(w_str) / float(h_str)
-            results_grid.child_aspect_ratio = aspect_ratio
-        except: results_grid.child_aspect_ratio = 1.0
-        
-        switch_t2i_page(1)
+        if not prompt_input.value:
+            page.snack_bar = ft.SnackBar(ft.Text("请输入编辑指令"), open=True)
+            page.update()
+            return
+
+        # 切换到结果页
+        if not is_wide_mode:
+            switch_t2i_page(1)
             
         generate_btn.disabled = True
+        generate_btn.text = "上传图片中..."
+        generate_btn.update()
+        
+        # ⭐️ 1. 智能设置 Grid 比例 (AutoSize)
+        target_size = size_dropdown.value
+        aspect_ratio = 1.0
+        
+        if target_size == "AutoSize":
+            # 尝试从第一张图获取比例
+            if uploaded_files:
+                dims = get_image_size(uploaded_files[0])
+                if dims:
+                    w, h = dims
+                    aspect_ratio = w / h
+        else:
+            try:
+                parts = target_size.split('x')
+                if len(parts) == 2:
+                    w, h = int(parts[0]), int(parts[1])
+                    aspect_ratio = w / h
+            except: pass
+            
+        results_grid.child_aspect_ratio = aspect_ratio
+        
+        # ⭐️ 2. 智能上传/复用 URL
+        image_url_param = None
+        current_model = model_dropdown.value
+        is_multi = current_model in MODELS_REQUIRING_LIST_INPUT
+        
+        try:
+            uploaded_urls_list = []
+            for path in uploaded_files:
+                # 调用智能上传函数（含缓存）
+                url = await upload_image_to_host(path)
+                if url:
+                    uploaded_urls_list.append(url)
+                else:
+                    raise Exception(f"图片上传失败: {os.path.basename(path)}")
+            
+            if is_multi:
+                image_url_param = uploaded_urls_list
+            else:
+                image_url_param = uploaded_urls_list[0]
+                
+        except Exception as up_err:
+            page.snack_bar = ft.SnackBar(ft.Text(str(up_err)), open=True)
+            generate_btn.disabled = False
+            generate_btn.text = "开始编辑"
+            generate_btn.update()
+            return
+            
+        generate_btn.text = "任务提交中..."
+        generate_btn.update()
+
         batch_count = int(batch_slider.value)
         results_grid.controls.clear()
         
         tasks_ui = []
         for i in range(batch_count):
+            # 使用 T2I 原有的卡片创建函数 (返回 6 个元素)
             card, img, status, btn_dl, btn_info, btn_browser = create_result_card_ui(i)
             results_grid.controls.append(card)
             tasks_ui.append((img, status, btn_dl, btn_info, btn_browser))
@@ -1712,73 +1824,80 @@ async def main(page: ft.Page):
         async def generate_single_image(idx, api_key, ui_refs):
             img_ref, status_ref, dl_ref, info_ref, browser_ref = ui_refs
             
-            # 辅助函数：控制 Ring 的显隐
-            def toggle_ring(visible):
-                if hasattr(status_ref, "associated_ring"):
-                    status_ref.associated_ring.visible = visible
-                    try: status_ref.associated_ring.update()
-                    except: pass
-
             try:
-                # 开始时显示动画
-                toggle_ring(True)
                 status_ref.value = "提交中..."
                 status_ref.color = current_primary_color
                 status_ref.update()
                 
                 headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+                
                 raw_seed = seed_input.value
                 if not raw_seed or not raw_seed.strip():
                     seed_val = -1
                 else:
-                    try:
-                        seed_val = int(raw_seed)
-                    except ValueError:
-                        seed_val = -1 
+                    try: seed_val = int(raw_seed)
+                    except ValueError: seed_val = -1
+                
                 if seed_val == -1: seed_val = random.randint(1, 10000000)
                 current_seed = seed_val + idx 
 
+                # ⭐️ 3. 构建 Payload (完全复刻 I2I 逻辑)
                 payload = {
-                    "model": model_dropdown.value, 
-                    "prompt": prompt_input.value, 
+                    "model": current_model,
+                    "image_url": image_url_param, 
+                    "prompt": prompt_input.value,
                     "negative_prompt": neg_prompt_input.value,
-                    "size": size_dropdown.value, 
-                    "num_inference_steps": int(steps_val_text.value),  
-                    "guidance_scale": float(guidance_val_text.value),  
+                    "num_inference_steps": int(steps_val_text.value), # 注意：T2I里是用 steps_val_text 读取值
+                    "guidance_scale": float(guidance_val_text.value),
                     "seed": current_seed
                 }
+                
+                if size_dropdown.value != "AutoSize":
+                    payload["size"] = size_dropdown.value
 
                 def do_post():
-                    return requests.post(f"{BASE_URL}v1/images/generations", headers={**headers, "X-ModelScope-Async-Mode": "true"}, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), timeout=20)
+                    return requests.post(
+                        f"{BASE_URL}v1/images/generations",
+                        headers={**headers, "X-ModelScope-Async-Mode": "true"},
+                        data=json.dumps(payload, ensure_ascii=False).encode('utf-8'),
+                        timeout=20
+                    )
                 
                 res = await asyncio.to_thread(do_post)
                 res.raise_for_status()
                 task_id = res.json().get("task_id")
+                
                 if not task_id: raise Exception("无TaskID")
 
                 for _ in range(60): 
                     await asyncio.sleep(2)
                     def do_poll():
-                        return requests.get(f"{BASE_URL}v1/tasks/{task_id}", headers={**headers, "X-ModelScope-Task-Type": "image_generation"}, timeout=10)
+                        return requests.get(
+                            f"{BASE_URL}v1/tasks/{task_id}", 
+                            headers={**headers, "X-ModelScope-Task-Type": "image_generation"}, 
+                            timeout=10
+                        )
                     res_poll = await asyncio.to_thread(do_poll)
                     data = res_poll.json()
+                    
                     raw_status = data.get("task_status")
                     cn_status = STATUS_TRANSLATIONS.get(raw_status, raw_status)
                     
                     if raw_status == "SUCCEED":
-                        # 成功时隐藏动画
-                        toggle_ring(False)
-
                         output_images = data.get("output_images", [])
+                        if not output_images and "results" in data: output_images = data["results"] 
+                        
                         if output_images:
-                            img_ref.src = output_images[0]
-                            img_ref.data = payload 
-                            img_ref.visible = True
-                            img_ref.is_downloaded = False # 新图片默认未下载
+                            final_url = output_images[0].get("url", output_images[0]) if isinstance(output_images[0], dict) else output_images[0]
+                            img_ref.src = final_url
                             
+                            payload["task_type"] = "image-edit"
+                            img_ref.data = payload 
+                            
+                            img_ref.visible = True
                             info_ref.visible = True
                             
-                            # 根据当前模式显示对应的按钮
+                            # 适配 T2I 的宽屏/竖屏按钮显隐逻辑
                             if is_wide_mode:
                                 dl_ref.visible = True
                                 browser_ref.visible = False
@@ -1793,15 +1912,14 @@ async def main(page: ft.Page):
                             browser_ref.update()
                             status_ref.update()
                         return True
-                    elif raw_status == "FAILED": raise Exception(data.get("message", "API Error"))
+                    elif raw_status == "FAILED":
+                        raise Exception(data.get("message", "API Error"))
                     else:
-                        status_ref.value = f"{cn_status}..." # 简化文案
+                        status_ref.value = f"生成中...[{cn_status}]"
                         status_ref.update()
                 raise Exception("超时")
 
             except Exception as e:
-                # 失败时隐藏动画
-                toggle_ring(False)
                 status_ref.value = "失败"
                 status_ref.tooltip = str(e)
                 status_ref.color = "red"
@@ -1815,6 +1933,7 @@ async def main(page: ft.Page):
         
         await asyncio.gather(*tasks, return_exceptions=True)
         generate_btn.disabled = False
+        generate_btn.text = "开始编辑"
         generate_btn.update()
 
     generate_btn.on_click = run_gen
@@ -1833,6 +1952,8 @@ async def main(page: ft.Page):
     # 1. 重新定义参数列表容器 (移除 generate_btn)
     page1_scroll_col = ft.Column([
             model_row,
+            ft.Container(height=8),
+            upload_container,   # ⭐️ 新增插入
             ft.Container(height=8),
             prompt_container,
             ft.Container(height=8),
@@ -2242,18 +2363,9 @@ async def main(page: ft.Page):
             for card in results_grid.controls:
                 try:
                     stack = card.content
-                    
-                    # --- 🎨 新增：更新 Loading 区域颜色 ---
-                    loading_bg_container = stack.controls[0] 
-                    
-                    # 检查是否为新结构 (Column)
-                    if isinstance(loading_bg_container.content, ft.Column):
-                        loading_col = loading_bg_container.content
-                        # loading_col.controls[0] 是 ProgressRing
-                        # loading_col.controls[2] 是 Text
-                        loading_col.controls[0].color = hex_val 
-                        loading_col.controls[2].color = hex_val
-                    # -----------------------------------
+                    status_container = stack.controls[0]
+                    status_text = status_container.content
+                    status_text.color = hex_val 
                     
                     meta_overlay = stack.controls[2]
                     meta_col = meta_overlay.content
@@ -2775,6 +2887,10 @@ async def main(page: ft.Page):
     await update_theme(stored_mode, stored_color_name)
     
     await asyncio.sleep(0.5) 
+    # ⭐️ 强制更新导航栏文字
+    nav_text_ref.value = "  图片编辑"
+    nav_btn_func_text.value = "图片编辑"
+    view_switch_btn.tooltip = "查看编辑结果"
     page.update()
     on_resize(None)
 
