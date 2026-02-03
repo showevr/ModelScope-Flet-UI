@@ -1,1 +1,1 @@
-![Uploading d927695e6e5bea5c2164becd20dcf29a.png…]()
+可以在window电脑、苹果电脑（macOS）、Linux 上正常运行，大家想要研究跨平台开发，或者是想自己增加、删减软件功能，都可以自由自在随意改
